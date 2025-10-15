@@ -1,0 +1,1307 @@
+//Backend
+const express = require("express");
+const axios = require("axios");
+const cors = require("cors");
+const Bottleneck = require("bottleneck");
+const axiosRetry = require("axios-retry").default;
+const http = require("http");
+const WebSocket = require("ws");
+const rateLimit = require("express-rate-limit");
+
+const app = express();
+const port = process.env.PORT || 5000;
+const WEBHOOK_SECRET = process.env.ZOHO_WEBHOOK_SECRET || "your-secret-token";
+
+app.use(cors());
+app.use(express.json());
+
+app.use((req, res, next) => {
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; connect-src 'self' http://localhost:5000 http://127.0.0.1:5000 http://192.168.3.8:5000"
+  );
+  next();
+});
+
+const clientId = "1000.VEPAX9T8TKDWJZZD95XT6NN52PRPQY";
+const clientSecret = "acca291b89430180ced19660cd28ad8ce1e4bec6e8";
+const refreshToken = "1000.465100d543b8d9471507bdf0b0263414.608f3f3817d11b09f142fd29810cca6f";
+
+let cachedAccessToken = null;
+let accessTokenExpiry = null;
+const limiter = new Bottleneck({ minTime: 1100 });
+
+axiosRetry(axios, {
+  retries: 4,
+  retryDelay: axiosRetry.exponentialDelay,
+  retryCondition: (error) =>
+    error.response && (error.response.status === 429 || error.response.status >= 500),
+});
+
+async function getAccessToken() {
+  const now = Date.now();
+  if (cachedAccessToken && accessTokenExpiry && now < accessTokenExpiry) {
+    return cachedAccessToken;
+  }
+  const params = new URLSearchParams();
+  params.append("refresh_token", refreshToken);
+  params.append("client_id", clientId);
+  params.append("client_secret", clientSecret);
+  params.append("grant_type", "refresh_token");
+  const response = await axios.post(
+    "https://accounts.zoho.com/oauth/v2/token",
+    params.toString(),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
+  cachedAccessToken = response.data.access_token;
+  accessTokenExpiry = now + (response.data.expires_in - 60) * 1000;
+  return cachedAccessToken;
+}
+
+async function fetchAllTickets(accessToken, departmentIds = [], agentId = null) {
+  let from = 1, limit = 100, allTickets = [];
+  const deptIdsToFetch = departmentIds.length > 0 ? departmentIds : [null];
+  for (const deptId of deptIdsToFetch) {
+    let continueFetching = true, pageFrom = 1;
+    while (continueFetching) {
+      const params = { from: pageFrom, limit };
+      if (deptId) params.departmentId = deptId;
+      if (agentId) params.agentId = agentId;
+      const response = await limiter.schedule(() =>
+        axios.get("https://desk.zoho.com/api/v1/tickets", {
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, params
+        })
+      );
+      const ticketsBatch = response.data.data || [];
+      allTickets = allTickets.concat(ticketsBatch);
+      if (ticketsBatch.length < limit) continueFetching = false;
+      else pageFrom += limit;
+    }
+  }
+  return allTickets;
+}
+
+async function fetchAllUsers(accessToken) {
+  let from = 1, limit = 100, allUsers = [];
+  while (true) {
+    const response = await limiter.schedule(() =>
+      axios.get("https://desk.zoho.com/api/v1/users", {
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, params: { from, limit }
+      })
+    );
+    allUsers = allUsers.concat(response.data.data || []);
+    if (response.data.data.length < limit) break;
+    from += limit;
+  }
+  return allUsers;
+}
+
+async function fetchUsersByIds(accessToken, ids) {
+  const users = [];
+  for (const id of ids) {
+    try {
+      const response = await limiter.schedule(() =>
+        axios.get(`https://desk.zoho.com/api/v1/users/${id}`, {
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        })
+      );
+      users.push(response.data);
+    } catch (err) {}
+  }
+  return users;
+}
+
+const statusMap = {
+  open: "open", "on hold": "hold", hold: "hold", closed: "closed",
+  "in progress": "inProgress", unassigned: "unassigned", "": "unassigned"
+};
+
+app.get("/api/zoho-assignees-with-ticket-counts", async (req, res) => {
+  try {
+    let departmentIds = [];
+    if (req.query.departmentIds) {
+      try { departmentIds = JSON.parse(req.query.departmentIds); }
+      catch { departmentIds = [req.query.departmentIds]; }
+    }
+    const agentId = req.query.agentId || null;
+    const accessToken = await getAccessToken();
+    let users = await fetchAllUsers(accessToken);
+    const tickets = await fetchAllTickets(accessToken, departmentIds, agentId);
+
+    const departmentsResp = await limiter.schedule(() =>
+      axios.get("https://desk.zoho.com/api/v1/departments", {
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }
+      })
+    );
+    const allDepartments = departmentsResp.data.data || [];
+    const agentIdToDeptId = {};
+
+    for (const dep of allDepartments) {
+      try {
+        const agentsResp = await limiter.schedule(() =>
+          axios.get(`https://desk.zoho.com/api/v1/departments/${dep.id}/agents`, {
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }
+          })
+        );
+        const depAgents = agentsResp.data.data || [];
+        depAgents.forEach(agent => {
+          if (agent.id) {
+            if (!agentIdToDeptId[agent.id]) agentIdToDeptId[agent.id] = [];
+            agentIdToDeptId[agent.id].push(dep.id);
+          }
+        });
+      } catch {}
+    }
+
+    const allAssigneeIds = new Set(tickets.map((t) => t.assigneeId).filter(Boolean));
+    const knownUserIds = new Set(users.map((u) => u.id));
+    const missingUserIds = Array.from(allAssigneeIds).filter((id) => !knownUserIds.has(id));
+    if (missingUserIds.length > 0) {
+      const missingUsers = await fetchUsersByIds(accessToken, missingUserIds);
+      users = users.concat(missingUsers);
+    }
+
+    const ticketStatusCountMap = {}, latestUnassignedTicketIdMap = {};
+    users.forEach((user) => {
+      ticketStatusCountMap[user.id] = {
+        open: 0, closed: 0, hold: 0, escalated: 0, unassigned: 0, inProgress: 0,
+      };
+      latestUnassignedTicketIdMap[user.id] = null;
+    });
+    ticketStatusCountMap["unassigned"] = {
+      open: 0, closed: 0, hold: 0, escalated: 0, unassigned: 0, inProgress: 0
+    };
+    latestUnassignedTicketIdMap["unassigned"] = null;
+
+    const allUnassignedTicketNumbers = [];
+    tickets.forEach((ticket) => {
+      const assigneeRaw = ticket.assigneeId === undefined || ticket.assigneeId === null ? "" : ticket.assigneeId.toString().toLowerCase();
+      const isUnassignedAssignee = assigneeRaw === "" || assigneeRaw === "none" || assigneeRaw === "null";
+      const assigneeId = isUnassignedAssignee ? "unassigned" : ticket.assigneeId;
+      if (!ticketStatusCountMap[assigneeId]) {
+        ticketStatusCountMap[assigneeId] = {
+          open: 0, closed: 0, hold: 0, escalated: 0, unassigned: 0, inProgress: 0,
+        };
+        latestUnassignedTicketIdMap[assigneeId] = null;
+      }
+      const rawStatus = (ticket.status || "").toLowerCase();
+      const normalizedStatus = statusMap[rawStatus] || "unassigned";
+      const isEscalated = ticket.isEscalated === true || String(ticket.escalated).toLowerCase() === "true";
+      if (isUnassignedAssignee && normalizedStatus !== "closed") {
+        const ticketNumber = ticket.ticketNumber || ticket.id;
+        if (ticketNumber) allUnassignedTicketNumbers.push(ticketNumber);
+        const currentLatest = latestUnassignedTicketIdMap[assigneeId];
+        if (currentLatest === null ||
+          (typeof currentLatest === "number" && ticketNumber > currentLatest) ||
+          (typeof currentLatest === "string" && ticketNumber.localeCompare(currentLatest) > 0)
+        ) latestUnassignedTicketIdMap[assigneeId] = ticketNumber;
+      }
+      if (isUnassignedAssignee && normalizedStatus === "closed") return;
+      if (isUnassignedAssignee) ticketStatusCountMap["unassigned"].unassigned++;
+      else if (normalizedStatus === "unassigned" || isEscalated) ticketStatusCountMap[assigneeId].escalated++;
+      else if (normalizedStatus === "open") ticketStatusCountMap[assigneeId].open++;
+      else if (normalizedStatus === "hold") ticketStatusCountMap[assigneeId].hold++;
+      else if (normalizedStatus === "closed") ticketStatusCountMap[assigneeId].closed++;
+      else if (normalizedStatus === "inProgress") ticketStatusCountMap[assigneeId].inProgress++;
+    });
+
+    users.push({
+      id: "unassigned", fullName: "Unassigned", displayName: "Unassigned",
+    });
+
+    const members = users
+      .filter((user) => user.id in ticketStatusCountMap)
+      .map((user) => {
+        let name = "Unknown";
+        if (user.firstName && user.lastName) name = `${user.firstName} ${user.lastName}`;
+        else if (user.fullName) name = user.fullName;
+        else if (user.displayName) name = user.displayName;
+        else if (user.name) name = user.name;
+        else if (user.email) name = user.email;
+        const userDeptArr = agentIdToDeptId[user.id] || [];
+        return {
+          id: user.id,
+          name,
+          departmentId: userDeptArr.length > 0 ? userDeptArr[0] : null,
+          tickets: ticketStatusCountMap[user.id],
+          latestUnassignedTicketId: latestUnassignedTicketIdMap[user.id] || null
+        };
+      });
+    res.json({ members, unassignedTicketNumbers: allUnassignedTicketNumbers });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch assignee ticket counts" });
+  }
+});
+
+app.get("/api/agent-departments/:agentId", async (req, res) => {
+  try {
+    const agentId = req.params.agentId;
+    if (!agentId) return res.status(400).json({ error: "Missing agentId parameter" });
+    const accessToken = await getAccessToken();
+    const response = await limiter.schedule(() =>
+      axios.get("https://desk.zoho.com/api/v1/departments", {
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      })
+    );
+    const departments = response.data.data || [];
+    const departmentsWithAgent = [];
+    for (const department of departments) {
+      try {
+        const agentsResponse = await limiter.schedule(() =>
+          axios.get(`https://desk.zoho.com/api/v1/departments/${department.id}/agents`, {
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+          })
+        );
+        const agents = agentsResponse.data.data || [];
+        if (agents.some((agent) => agent.id === agentId)) {
+          departmentsWithAgent.push({ id: department.id, name: department.name });
+        }
+      } catch (err) {}
+    }
+    res.json({ departments: departmentsWithAgent });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to get agent's departments" });
+  }
+});
+
+app.get("/api/zoho-department-ticket-counts", async (req, res) => {
+  try {
+    const accessToken = await getAccessToken();
+    const depResp = await limiter.schedule(() =>
+      axios.get("https://desk.zoho.com/api/v1/departments", {
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      })
+    );
+    const departments = depResp.data.data || [];
+    const tickets = await fetchAllTickets(accessToken);
+    const ticketStatusCountMap = {};
+    departments.forEach((dep) => {
+      ticketStatusCountMap[dep.id] = { open: 0, closed: 0, hold: 0, escalated: 0, unassigned: 0, inProgress: 0 };
+    });
+    tickets.forEach((ticket) => {
+      const deptId = ticket.departmentId;
+      if (deptId && ticketStatusCountMap[deptId]) {
+        const rawStatus = (ticket.status || "").toLowerCase();
+        const normalizedStatus = statusMap[rawStatus] || "unassigned";
+        const isEscalated = ticket.isEscalated === true || String(ticket.escalated).toLowerCase() === "true";
+        if ((!ticket.assigneeId || ["null", "none", null].includes(ticket.assigneeId)) && normalizedStatus !== "closed") {
+          ticketStatusCountMap[deptId].unassigned++;
+        } else if (normalizedStatus === "unassigned" || isEscalated)
+          ticketStatusCountMap[deptId].escalated++;
+        else if (normalizedStatus === "open")
+          ticketStatusCountMap[deptId].open++;
+        else if (normalizedStatus === "hold")
+          ticketStatusCountMap[deptId].hold++;
+        else if (normalizedStatus === "closed")
+          ticketStatusCountMap[deptId].closed++;
+        else if (normalizedStatus === "inProgress")
+          ticketStatusCountMap[deptId].inProgress++;
+      }
+    });
+    const departmentTicketCounts = departments.map((dep) => ({
+      id: dep.id,
+      name: dep.name,
+      tickets: ticketStatusCountMap[dep.id] || { open: 0, closed: 0, hold: 0, escalated: 0, unassigned: 0, inProgress: 0 },
+    }));
+    res.json({ departmentTicketCounts });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to get department ticket counts" });
+  }
+});
+
+app.get("/api/zoho-departments", async (req, res) => {
+  try {
+    const accessToken = await getAccessToken();
+    const depResp = await limiter.schedule(() =>
+      axios.get("https://desk.zoho.com/api/v1/departments", {
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }
+      })
+    );
+    const departments = depResp.data.data || [];
+    const departmentsWithAgents = await Promise.all(
+      departments.map(async (dep) => {
+        try {
+          const agentsResp = await limiter.schedule(() =>
+            axios.get(`https://desk.zoho.com/api/v1/departments/${dep.id}/agents`, {
+              headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }
+            })
+          );
+          const agents = (agentsResp.data.data || []).map(a =>
+            a.displayName || a.fullName || a.name || a.email || "Unknown"
+          );
+          return { ...dep, agents };
+        } catch (err) {
+          return { ...dep, agents: [] };
+        }
+      })
+    );
+    res.json({ departments: departmentsWithAgents });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch departments with agents" });
+  }
+});
+
+app.get("/", (req, res) => {
+  res.send("Backend server running. Use API endpoints under /api.");
+});
+
+const webhookLimiter = rateLimit({ windowMs: 1000, max: 10, message: "Too many webhook requests, please try again later." });
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+function noop() {}
+function heartbeat() { this.isAlive = true; }
+wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", heartbeat);
+  ws.on("error", (error) => {});
+  ws.on("close", (code, reason) => {});
+});
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping(noop);
+  });
+}, 30000);
+
+app.post("/webhook/zoho", webhookLimiter, (req, res) => {
+  try {
+    const token = req.headers["x-zoho-webhook-token"];
+    if (token !== WEBHOOK_SECRET) return res.status(401).send("Unauthorized");
+    const eventData = req.body;
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(eventData));
+    });
+    res.status(200).send("Received");
+  } catch (err) {
+    res.status(500).send("Internal Server Error");
+  }
+});
+
+server.listen(port, "0.0.0.0", () => {
+  console.log(`Backend server running on port ${port}`);
+});
+
+//Frontend
+
+import React, { useEffect, useState, useMemo, useRef } from "react";
+import Select, { components } from "react-select";
+import { FaBars, FaSpinner } from "react-icons/fa";
+import "./TicketDashboard.css";
+
+const ASSIGNEE_COL_ID = 4549002565209988;
+const OPEN_STATUS_COL_ID = 1001;
+const HOLD_STATUS_COL_ID = 1003;
+const ESCALATED_STATUS_COL_ID = 1004;
+const UNASSIGNED_STATUS_COL_ID = 1005;
+const IN_PROGRESS_STATUS_COL_ID = 1006;
+
+const backendurl = "http://localhost:5000";
+const CANDIDATES_PER_PAGE = 15;
+
+const Option = (props) => (
+  <components.Option {...props}>
+    <span
+      className={`custom-checkbox${props.isSelected ? ' checked' : ''}`}
+      onClick={(e) => { e.stopPropagation(); props.selectOption(props.data); }}
+      style={{ cursor: "pointer" }}
+    ></span>
+    <span style={{ fontSize: '11px', marginLeft: 8, verticalAlign: 'middle' }}>{props.label}</span>
+  </components.Option>
+);
+
+const selectStyles = {
+  control: (base) => ({
+    ...base,
+    minWidth: 80,
+    maxWidth: 200,
+    height: 40,
+    background: "linear-gradient(145deg, #d0daf9, #a3baff)",
+    borderRadius: 18,
+    border: "1px solid #5e7ce4",
+    boxShadow:
+      "8px 8px 28px rgba(63,81,181,0.8), inset 6px 6px 14px #fff, inset -6px -6px 14px rgba(48,62,142,0.85)",
+    fontWeight: 900,
+    fontSize: 12,
+    textTransform: "uppercase",
+    fontFamily: "'Poppins',sans-serif",
+    padding: "0 1px",
+  }),
+  option: (base) => ({
+    ...base,
+    fontSize: "10px",
+    fontWeight: 900,
+  }),
+  valueContainer: (base) => ({
+    ...base,
+    paddingRight: 0,
+  }),
+  multiValue: () => ({ display: "none" }),
+  multiValueLabel: () => ({ display: "none" }),
+  menuPortal: (base) => ({ ...base, zIndex: 9999 }),
+};
+
+const getDepartmentAgentMap = (rows, departments) => {
+  const map = {};
+  departments.forEach(dep => {
+    map[dep.value] = [];
+  });
+  rows.forEach(row => {
+    const agentName = row.cells.find((c) => c.columnId === ASSIGNEE_COL_ID)?.value;
+    const departmentId = row.departmentId || row.department_id || row.deptId || null;
+    if (departmentId && map[departmentId]) {
+      map[departmentId].push(agentName);
+    } else if (!departmentId && map["no_department"]) {
+      map["no_department"].push(agentName);
+    }
+  });
+  return map;
+};
+
+const DepartmentOption = (props) => {
+  const [expanded, setExpanded] = useState(false);
+  const deptAgentMap = props.data.deptAgentMap || {};
+  const agentNames = deptAgentMap[props.data.value] || [];
+  const handleExpand = (e) => {
+    e.stopPropagation();
+    setExpanded((v) => !v);
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "center" }}>
+        <span
+          style={{ cursor: "pointer", marginRight: 6, fontWeight: 900, fontSize: 14 }}
+          onClick={handleExpand}
+        >
+          {expanded ? "v" : ">"}
+        </span>
+        <span style={{ fontSize: "11px" }}>{props.label}</span>
+      </div>
+      {expanded && agentNames.length > 0 && (
+        <div style={{
+          marginLeft: 22,
+          marginTop: 4,
+          padding: "4px 6px",
+          background: "#dae3f7",
+          borderRadius: 6,
+          color: "#222",
+          fontSize: "10px",
+        }}>
+          {agentNames.map((name, idx) => (
+            <div key={name + "_" + idx}>{name}</div>
+          ))}
+        </div>
+      )}
+      {expanded && agentNames.length === 0 && (
+        <div style={{
+          marginLeft: 22,
+          marginTop: 2,
+          color: "#888",
+          fontSize: "10px",
+        }}>
+          No agents
+        </div>
+      )}
+    </div>
+  );
+};
+async function fetchZohoDataFromBackend(setRows, setError, setUnassignedTicketNumbers) {
+  try {
+    const url = `${backendurl}/api/zoho-assignees-with-ticket-counts`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Failed to fetch Zoho assignee ticket counts");
+    const data = await response.json();
+    const rows = data.members.map((member, idx) => ({
+      cells: [
+        { columnId: ASSIGNEE_COL_ID, value: member.name },
+        { columnId: OPEN_STATUS_COL_ID, value: member.tickets.open?.toString() || "0" },
+        { columnId: HOLD_STATUS_COL_ID, value: member.tickets.hold?.toString() || "0" },
+        { columnId: ESCALATED_STATUS_COL_ID, value: member.tickets.escalated?.toString() || "0" },
+        { columnId: UNASSIGNED_STATUS_COL_ID, value: member.tickets.unassigned?.toString() || "0" },
+        { columnId: IN_PROGRESS_STATUS_COL_ID, value: member.tickets.inProgress?.toString() || "0" },
+      ],
+      departmentId: member.departmentId || member.department_id || member.deptId || null,
+      latestUnassignedTicketId: member.latestUnassignedTicketId || null,
+      key: String(member.departmentId || "no_department") + "_" + idx,
+    }));
+    setRows(rows);
+    setUnassignedTicketNumbers(data.unassignedTicketNumbers || []);
+    setError(null);
+  } catch (error) {
+    setError(error.message);
+  }
+}
+
+async function fetchZohoDepartmentTicketCounts(setDepartmentRows, setError, setUnassignedTicketNumbers, departmentIds) {
+  try {
+    if (departmentIds.length === 0) {
+      setDepartmentRows([]);
+      return;
+    }
+    const url = `${backendurl}/api/zoho-assignees-with-ticket-counts?departmentIds=${encodeURIComponent(
+      JSON.stringify(departmentIds)
+    )}`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Failed to fetch Zoho department ticket counts");
+    const data = await response.json();
+    const rows = data.members.map((member, idx) => ({
+      cells: [
+        { columnId: ASSIGNEE_COL_ID, value: member.name },
+        { columnId: OPEN_STATUS_COL_ID, value: member.tickets.open?.toString() || "0" },
+        { columnId: HOLD_STATUS_COL_ID, value: member.tickets.hold?.toString() || "0" },
+        { columnId: ESCALATED_STATUS_COL_ID, value: member.tickets.escalated?.toString() || "0" },
+        { columnId: UNASSIGNED_STATUS_COL_ID, value: member.tickets.unassigned?.toString() || "0" },
+        { columnId: IN_PROGRESS_STATUS_COL_ID, value: member.tickets.inProgress?.toString() || "0" },
+      ],
+      departmentId: member.departmentId || member.department_id || member.deptId || null,
+      latestUnassignedTicketId: member.latestUnassignedTicketId || null,
+      key: String(member.departmentId || "no_department") + "_" + idx,
+    }));
+    setDepartmentRows(rows);
+    setUnassignedTicketNumbers(data.unassignedTicketNumbers || []);
+    setError(null);
+  } catch (error) {
+    setError(error.message);
+  }
+}
+
+async function fetchDepartmentTicketCountsSummary(setDepartmentSummaryRows, setError) {
+  try {
+    const response = await fetch(`${backendurl}/api/zoho-department-ticket-counts`);
+    if (!response.ok) throw new Error("Failed to fetch department ticket counts");
+    const data = await response.json();
+    const seen = new Set();
+    const rows = data.departmentTicketCounts
+      .filter(dep => {
+        if (seen.has(dep.id)) return false;
+        seen.add(dep.id);
+        return true;
+      })
+      .map((dep, idx) => ({
+        cells: [
+          { columnId: ASSIGNEE_COL_ID, value: dep.name },
+          { columnId: OPEN_STATUS_COL_ID, value: dep.tickets.open?.toString() || "0" },
+          { columnId: HOLD_STATUS_COL_ID, value: dep.tickets.hold?.toString() || "0" },
+          { columnId: ESCALATED_STATUS_COL_ID, value: dep.tickets.escalated?.toString() || "0" },
+          { columnId: UNASSIGNED_STATUS_COL_ID, value: dep.tickets.unassigned?.toString() || "0" },
+          { columnId: IN_PROGRESS_STATUS_COL_ID, value: dep.tickets.inProgress?.toString() || "0" },
+        ],
+        latestUnassignedTicketId: null,
+        key: String(dep.id) + "_" + idx,
+      }));
+    setDepartmentSummaryRows(rows);
+    setError(null);
+  } catch (error) {
+    setError(error.message);
+  }
+}
+function TicketDashboard() {
+  const hasFetchedRef = useRef(false);
+
+  const [rows, setRows] = useState(() => {
+    const saved = localStorage.getItem("ticketDashboardRows");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [departmentRows, setDepartmentRows] = useState(() => {
+    const saved = localStorage.getItem("departmentRows");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [departmentSummaryRows, setDepartmentSummaryRows] = useState(() => {
+    const saved = localStorage.getItem("departmentSummaryRows");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [error, setError] = useState(null);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [selectedCandidates, setSelectedCandidates] = useState(() => {
+    const saved = localStorage.getItem("selectedCandidates");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [selectedStatuses, setSelectedStatuses] = useState(() => {
+    const saved = localStorage.getItem("selectedStatuses");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [selectedDepartments, setSelectedDepartments] = useState(() => {
+    const saved = localStorage.getItem("selectedDepartments");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [currentPage, setCurrentPage] = useState(1);
+  const [sortOrder, setSortOrder] = useState("asc");
+  const [openSum, setOpenSum] = useState(() => {
+    const saved = localStorage.getItem("openSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [holdSum, setHoldSum] = useState(() => {
+    const saved = localStorage.getItem("holdSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [escalatedSum, setEscalatedSum] = useState(() => {
+    const saved = localStorage.getItem("escalatedSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [inProgressSum, setInProgressSum] = useState(() => {
+    const saved = localStorage.getItem("inProgressSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [globalUnassignedSum, setGlobalUnassignedSum] = useState(() => {
+    const saved = localStorage.getItem("globalUnassignedSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [unassignedTicketNumbers, setUnassignedTicketNumbers] = useState(() => {
+    const saved = localStorage.getItem("unassignedTicketNumbers");
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  useEffect(() => {
+    localStorage.setItem("unassignedTicketNumbers", JSON.stringify(unassignedTicketNumbers));
+  }, [unassignedTicketNumbers]);
+
+  const [currentUnassignedIndex, setCurrentUnassignedIndex] = useState(0);
+  const [filtersVisible, setFiltersVisible] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [departments, setDepartments] = useState([]);
+  const [filteredCandidates, setFilteredCandidates] = useState([]);
+  const statusOptions = [
+    { value: "open", label: "Open" },
+    { value: "hold", label: "Hold" },
+    { value: "inProgress", label: "In Progress" },
+    { value: "escalated", label: "Escalated" },
+    { value: "unassigned", label: "Unassigned" },
+    { value: "total", label: "Total" },
+  ];
+
+  async function refreshData() {
+    try {
+      setLoading(true);
+      await fetchZohoDataFromBackend(setRows, setError, setUnassignedTicketNumbers);
+      await fetchDepartmentTicketCountsSummary(setDepartmentSummaryRows, setError);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    localStorage.setItem("ticketDashboardRows", JSON.stringify(rows));
+  }, [rows]);
+  useEffect(() => {
+    localStorage.setItem("departmentRows", JSON.stringify(departmentRows));
+  }, [departmentRows]);
+  useEffect(() => {
+    localStorage.setItem("departmentSummaryRows", JSON.stringify(departmentSummaryRows));
+  }, [departmentSummaryRows]);
+  useEffect(() => {
+    localStorage.setItem("selectedCandidates", JSON.stringify(selectedCandidates));
+  }, [selectedCandidates]);
+  useEffect(() => {
+    localStorage.setItem("selectedStatuses", JSON.stringify(selectedStatuses));
+  }, [selectedStatuses]);
+  useEffect(() => {
+    localStorage.setItem("selectedDepartments", JSON.stringify(selectedDepartments));
+  }, [selectedDepartments]);
+  useEffect(() => {
+    if (openSum !== null) localStorage.setItem("openSum", JSON.stringify(openSum));
+  }, [openSum]);
+  useEffect(() => {
+    if (holdSum !== null) localStorage.setItem("holdSum", JSON.stringify(holdSum));
+  }, [holdSum]);
+  useEffect(() => {
+    if (escalatedSum !== null) localStorage.setItem("escalatedSum", JSON.stringify(escalatedSum));
+  }, [escalatedSum]);
+  useEffect(() => {
+    if (inProgressSum !== null) localStorage.setItem("inProgressSum", JSON.stringify(inProgressSum));
+  }, [inProgressSum]);
+  useEffect(() => {
+    if (globalUnassignedSum !== null) localStorage.setItem("globalUnassignedSum", JSON.stringify(globalUnassignedSum));
+  }, [globalUnassignedSum]);
+  useEffect(() => {
+    if (selectedDepartments.length > 0) {
+      const ids = selectedDepartments.map((dep) => dep.value);
+      fetchZohoDepartmentTicketCounts(setDepartmentRows, setError, setUnassignedTicketNumbers, ids);
+    } else {
+      setDepartmentRows([]);
+    }
+  }, [selectedDepartments]);
+  useEffect(() => {
+    if (!hasFetchedRef.current) {
+      refreshData();
+      hasFetchedRef.current = true;
+    }
+    const dataInterval = setInterval(() => refreshData(), 300000);
+    const reloadInterval = setInterval(() => window.location.reload(), 300000);
+    return () => {
+      clearInterval(dataInterval);
+      clearInterval(reloadInterval);
+    };
+  }, []);
+  useEffect(() => {
+    fetch(`${backendurl}/api/zoho-departments`)
+      .then((res) => res.json())
+      .then((data) => {
+        const deptOptionsRaw = (data.departments || []);
+        // Add no_department option for agents with null departmentId
+        const extendedDeptOptions = [
+          ...deptOptionsRaw,
+          { id: "no_department", name: "No Department", showInPortal: false, status: "none" }
+        ];
+        const deptAgentMapRaw = getDepartmentAgentMap(rows, extendedDeptOptions);
+        const deptOptions = extendedDeptOptions.map((dep, idx) => ({
+          value: dep.id,
+          label: `${dep.name}${typeof dep.showInPortal !== 'undefined'
+            ? (dep.showInPortal ? ' (Portal: Yes)' : ' (Portal: No)')
+            : dep.status ? ` (${dep.status})` : ''}`,
+          key: String(dep.id) + "_" + idx,
+          deptAgentMap: deptAgentMapRaw,
+        }));
+        setDepartments(deptOptions);
+      });
+  }, [rows]);
+  useEffect(() => {
+    let total = 0;
+    rows.forEach((row) => {
+      const cell = row.cells.find((cell) => cell.columnId === UNASSIGNED_STATUS_COL_ID);
+      if (cell) total += Number(cell.value || 0);
+    });
+    setGlobalUnassignedSum(rows.length === 0 ? null : total);
+  }, [rows]);
+  useEffect(() => {
+    if (unassignedTicketNumbers.length > 0) {
+      const interval = setInterval(() => {
+        setCurrentUnassignedIndex((prev) => (prev + 1) % unassignedTicketNumbers.length);
+      }, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [unassignedTicketNumbers]);
+
+  const nonZeroRows = useMemo(() => rows, [rows]);
+  const candidateOptions = useMemo(() => {
+    const validNames = [];
+    nonZeroRows.forEach((row) => {
+      const name = row.cells.find((c) => c.columnId === ASSIGNEE_COL_ID)?.value?.trim();
+      const ticketCounts = row.cells
+        .filter((cell) =>
+          [
+            OPEN_STATUS_COL_ID,
+            HOLD_STATUS_COL_ID,
+            ESCALATED_STATUS_COL_ID,
+            UNASSIGNED_STATUS_COL_ID,
+            IN_PROGRESS_STATUS_COL_ID,
+          ].includes(cell.columnId)
+        )
+        .map((cell) => Number(cell.value) || 0);
+      if (name && ticketCounts.some((count) => count > 0)) {
+        validNames.push(name);
+      }
+    });
+    return Array.from(new Set(validNames))
+      .sort()
+      .map((name) => ({ value: name, label: name }));
+  }, [nonZeroRows]);
+  const selectedStatusKeys = useMemo(
+    () =>
+      selectedStatuses.length > 0
+        ? selectedStatuses.map((s) => s.value)
+        : statusOptions.map((s) => s.value),
+    [selectedStatuses]
+  );
+  const personFilterOption = (option, inputValue) => {
+  if (!inputValue) return true;
+  if (selectedCandidates.find((sel) => sel.value === option.value)) return true;
+  return option.label.toLowerCase().includes(inputValue.toLowerCase());
+};
+
+  useEffect(() => {
+    const filteredRows = nonZeroRows.filter((row) => {
+      const candidateRaw = row.cells.find((c) => c.columnId === ASSIGNEE_COL_ID)?.value?.trim() || "";
+      const candidateLower = candidateRaw.toLowerCase();
+      if (searchTerm && !candidateLower.includes(searchTerm.toLowerCase())) return false;
+      if (
+        selectedCandidates.length > 0 &&
+        !selectedCandidates.some((c) => c.value.toLowerCase() === candidateLower)
+      )
+        return false;
+      return true;
+    });
+    const candidateCountMap = {};
+    filteredRows.forEach((row) => {
+      const candidate = row.cells.find((c) => c.columnId === ASSIGNEE_COL_ID)?.value?.trim();
+      if (!candidate) return;
+      const cellsById = row.cells.reduce((acc, cell) => {
+        acc[cell.columnId] = Number(cell.value) || 0;
+        return acc;
+      }, {});
+      if (!candidateCountMap[candidate]) {
+        candidateCountMap[candidate] = {
+          open: 0,
+          hold: 0,
+          escalated: 0,
+          unassigned: 0,
+          inProgress: 0,
+          latestUnassignedTicketId: row.latestUnassignedTicketId || null,
+        };
+      }
+      if (selectedStatusKeys.includes("open"))
+        candidateCountMap[candidate].open += cellsById[OPEN_STATUS_COL_ID];
+      if (selectedStatusKeys.includes("hold"))
+        candidateCountMap[candidate].hold += cellsById[HOLD_STATUS_COL_ID];
+      if (selectedStatusKeys.includes("inProgress"))
+        candidateCountMap[candidate].inProgress += cellsById[IN_PROGRESS_STATUS_COL_ID];
+      if (selectedStatusKeys.includes("escalated"))
+        candidateCountMap[candidate].escalated += cellsById[ESCALATED_STATUS_COL_ID];
+      if (selectedStatusKeys.includes("unassigned"))
+        candidateCountMap[candidate].unassigned += cellsById[UNASSIGNED_STATUS_COL_ID];
+    });
+    const sums = { open: 0, hold: 0, escalated: 0, unassigned: 0, inProgress: 0 };
+    Object.values(candidateCountMap).forEach((c) => {
+      sums.open += c.open;
+      sums.hold += c.hold;
+      sums.escalated += c.escalated;
+      sums.unassigned += c.unassigned;
+      sums.inProgress += c.inProgress;
+    });
+    setOpenSum(filteredRows.length === 0 ? null : sums.open);
+    setHoldSum(filteredRows.length === 0 ? null : sums.hold);
+    setEscalatedSum(filteredRows.length === 0 ? null : sums.escalated);
+    setInProgressSum(filteredRows.length === 0 ? null : sums.inProgress);
+    setFilteredCandidates(Object.entries(candidateCountMap));
+    setCurrentPage(1);
+  }, [nonZeroRows, searchTerm, selectedCandidates, selectedStatuses, selectedStatusKeys]);
+  const [gridCells, setGridCells] = useState([]);
+  const intervalRef = useRef(null);
+  useEffect(() => {
+    let displayRows = [];
+    if (selectedDepartments.length > 0 && departmentRows.length > 0) {
+      displayRows = departmentRows
+        .filter((row) => {
+          const agentName = row.cells.find(cell => cell.columnId === ASSIGNEE_COL_ID)?.value?.trim();
+          return (
+            selectedCandidates.length === 0 ||
+            selectedCandidates.some(c => c.value.toLowerCase() === agentName?.toLowerCase())
+          );
+        })
+        .map(row => [
+          row.cells.find((cell) => cell.columnId === ASSIGNEE_COL_ID)?.value,
+          {
+            open: Number(row.cells.find((cell) => cell.columnId === OPEN_STATUS_COL_ID)?.value || 0),
+            hold: Number(row.cells.find((cell) => cell.columnId === HOLD_STATUS_COL_ID)?.value || 0),
+            escalated: Number(row.cells.find((cell) => cell.columnId === ESCALATED_STATUS_COL_ID)?.value || 0),
+            unassigned: Number(row.cells.find((cell) => cell.columnId === UNASSIGNED_STATUS_COL_ID)?.value || 0),
+            inProgress: Number(row.cells.find((cell) => cell.columnId === IN_PROGRESS_STATUS_COL_ID)?.value || 0),
+            latestUnassignedTicketId: row.latestUnassignedTicketId || null,
+          }
+        ]);
+    } else {
+      displayRows = filteredCandidates;
+    }
+    const sortedFiltered = [...displayRows].sort((a, b) => {
+      if (a[0] < b[0]) return sortOrder === "asc" ? -1 : 1;
+      if (a[0] > b[0]) return sortOrder === "asc" ? 1 : -1;
+      return 0;
+    });
+    const nonZeroFiltered = sortedFiltered.filter(
+      ([_, counts]) =>
+        counts.open > 0 ||
+        counts.hold > 0 ||
+        counts.escalated > 0 ||
+        counts.unassigned > 0 ||
+        counts.inProgress > 0
+    );
+    const totalPages = Math.ceil(nonZeroFiltered.length / CANDIDATES_PER_PAGE);
+    if (currentPage > totalPages && totalPages > 0) setCurrentPage(1);
+    const start = (currentPage - 1) * CANDIDATES_PER_PAGE;
+    const end = Math.min(start + CANDIDATES_PER_PAGE, nonZeroFiltered.length);
+    const cells = [];
+    for (let i = start; i < end; i++) {
+      const [candidate, counts] = nonZeroFiltered[i];
+      const totalSelected = selectedStatusKeys.includes("total");
+      const selectedStatusesExcludingTotal = selectedStatusKeys.filter((k) => k !== "total");
+      const sumSelectedStatuses = selectedStatusesExcludingTotal.reduce(
+        (sum, key) => sum + (counts[key] || 0),
+        0
+      );
+      const showSumOnly = totalSelected && selectedStatusesExcludingTotal.length > 0;
+      cells.push(
+        <div key={candidate} className="grid-cell" style={{ animationDelay: `${(i - start) * 65}ms` }}>
+          <div className="candidate-name">{candidate}</div>
+          <div className="ticket-counts" style={{ justifyContent: "center", display: "flex", gap: 10 }}>
+            {showSumOnly ? (
+              <div className="count-box total">{sumSelectedStatuses}</div>
+            ) : selectedStatusesExcludingTotal.length > 0 ? (
+              <>
+                {selectedStatusKeys.includes("open") && (
+                  <div className="count-box open">{counts.open}</div>
+                )}
+                {selectedStatusKeys.includes("hold") && (
+                  <div className="count-box hold">{counts.hold}</div>
+                )}
+                {selectedStatusKeys.includes("inProgress") && (
+                  <div className="count-box inprogress">{counts.inProgress}</div>
+                )}
+                {selectedStatusKeys.includes("escalated") && (
+                  <div className="count-box escalated">{counts.escalated}</div>
+                )}
+                {selectedStatusKeys.includes("unassigned") && (
+                  <div
+                    className="count-box unassigned"
+                    style={{
+                      backgroundColor:
+                        counts.latestUnassignedTicketId === unassignedTicketNumbers[currentUnassignedIndex]
+                          ? "#ffd700"
+                          : "#bd2331",
+                      color:
+                        counts.latestUnassignedTicketId === unassignedTicketNumbers[currentUnassignedIndex]
+                          ? "#34495e"
+                          : "#fff",
+                      fontWeight:
+                        counts.latestUnassignedTicketId === unassignedTicketNumbers[currentUnassignedIndex]
+                          ? 900
+                          : 700,
+                    }}
+                  >
+                    {counts.unassigned}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="count-box total">
+                {counts.open + counts.hold + counts.escalated + counts.unassigned + counts.inProgress}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+    setGridCells(cells);
+  }, [
+    filteredCandidates,
+    currentPage,
+    sortOrder,
+    selectedStatusKeys,
+    unassignedTicketNumbers,
+    currentUnassignedIndex,
+    selectedDepartments,
+    departmentRows,
+  ]);
+  useEffect(() => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    const rowCount =
+      selectedDepartments.length > 0 && departmentRows.length > 0
+        ? departmentRows.length
+        : filteredCandidates.length;
+    const totalPages = Math.ceil(rowCount / CANDIDATES_PER_PAGE);
+    if (totalPages > 1) {
+      intervalRef.current = setInterval(() => {
+        setCurrentPage((prev) => (prev < totalPages ? prev + 1 : 1));
+      }, 10000);
+    }
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [filteredCandidates, departmentRows, selectedDepartments]);
+
+  const showLegendTotal = selectedStatuses.some((s) => s.value === "total");
+  const currentTicketNumber =
+    unassignedTicketNumbers.length > 0
+      ? unassignedTicketNumbers[currentUnassignedIndex].toString().padStart(5, "0")
+      : "00000";
+
+  return (
+    <>
+      <div className="dashboard-header-main" style={{ maxWidth: 1300, margin: "0 auto 30px auto", position: "relative" }}>
+        <div className="dashboard-header-top" style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          position: "relative",
+        }}>
+          <img className="header-image" src="/suprajit_logo_BG.png" alt="Left icon" style={{ height: 80, width: "auto" }} />
+          <div className="dashboard-title-container" style={{
+            fontWeight: 900,
+            fontSize: 60,
+            letterSpacing: 2,
+            color: "#e0eaff",
+            textShadow: "2px 2px 6px rgba(0, 0, 50, 0.7)",
+            userSelect: "none",
+            textTransform: "uppercase",
+            position: "relative",
+            zIndex: 2,
+          }}>
+            TICKET DASHBOARD
+          </div>
+          <div style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-end",
+            gap: 10,
+            position: "relative",
+            zIndex: 2,
+          }}>
+            <img className="header-image" src="/IT-LOGO.png" alt="Right icon" style={{ height: 70, width: "auto" }} />
+          </div>
+        </div>
+        <div className="dashboard-header-filters" style={{
+          maxWidth: 1400,
+          margin: "0 auto",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          width: "100%",
+        }}>
+          <div style={{ height: 40 }} />
+          <div className="legend-bar" style={{
+            display: "flex",
+            gap: 10,
+            flex: filtersVisible ? "initial" : 1,
+            transition: "flex 0.3s ease",
+          }}>
+            <div className="legend-item open" style={{ flex: 1, textAlign: "center", fontSize: 20, fontWeight: 900 }}>
+              OPEN <span style={{ fontWeight: 900, marginLeft: 4 }}>{openSum !== null ? openSum.toString().padStart(3, "0") : "--"}</span>
+            </div>
+            <div className="legend-item hold" style={{ flex: 1, textAlign: "center", fontSize: 22, fontWeight: 900 }}>
+              HOLD <span style={{ fontWeight: 900, marginLeft: 4 }}>{holdSum !== null ? holdSum.toString().padStart(3, "0") : "--"}</span>
+            </div>
+            <div className="legend-item inprogress" style={{ flex: 1, textAlign: "center", fontSize: 20, fontWeight: 900 }}>
+              IN PROGRESS <span style={{ fontWeight: 900, marginLeft: 4 }}>{inProgressSum !== null ? inProgressSum.toString().padStart(3, "0") : "--"}</span>
+            </div>
+            <div className="legend-item escalated" style={{ flex: 1, textAlign: "center", fontSize: 20, fontWeight: 900 }}>
+              ESCALATED <span style={{ fontWeight: 900, marginLeft: 4 }}>{escalatedSum !== null ? escalatedSum.toString().padStart(3, "0") : "--"}</span>
+            </div>
+            <div className="unassigned-box-blink"
+              style={{
+                flex: 1,
+                textAlign: "center",
+                fontWeight: 900,
+                display: "flex",
+                justifyContent: "center",
+                alignItems: "center",
+                gap: 10,
+                paddingLeft: 24,
+                paddingRight: 0,
+              }}>
+              UNASSIGNED <span>{globalUnassignedSum !== null ? globalUnassignedSum.toString().padStart(3, "0") : "--"}</span>
+              <span
+                style={{
+                  padding: "11px 11px",
+                  backgroundColor: "#1e4489",
+                  borderRadius: 16,
+                  color: "#fff",
+                  fontWeight: 700,
+                  fontSize: 22,
+                  userSelect: "none",
+                  display: "inline-block",
+                  verticalAlign: "middle",
+                  minWidth: 80,
+                  textAlign: "center"
+                }}
+              >
+                {currentTicketNumber}
+              </span>
+            </div>
+            {showLegendTotal && (
+              <div className="legend-item total"
+                style={{
+                  backgroundColor: "#ffd700",
+                  color: "#1e4489",
+                  fontWeight: 700,
+                  borderRadius: 12,
+                  padding: "0 10px",
+                  flex: 1,
+                  textAlign: "center",
+                  fontSize: 20,
+                }}>
+                TOTAL{" "}
+                <span>
+                  {(
+                    (selectedStatusKeys.includes("open") ? (openSum || 0) : 0) +
+                    (selectedStatusKeys.includes("hold") ? (holdSum || 0) : 0) +
+                    (selectedStatusKeys.includes("inProgress") ? (inProgressSum || 0) : 0) +
+                    (selectedStatusKeys.includes("escalated") ? (escalatedSum || 0) : 0) +
+                    (selectedStatusKeys.includes("unassigned") ? (globalUnassignedSum || 0) : 0)
+                  ).toString().padStart(3, "0")}
+                </span>
+              </div>
+            )}
+          </div>
+          <button
+            className="hamburger-btn"
+            style={{
+              width: 30,
+              height: 30,
+              borderRadius: 10,
+              border: "none",
+              cursor: "pointer",
+              marginLeft: 20,
+              display: "block",
+            }}
+            onClick={() => setFiltersVisible((v) => !v)}
+            aria-label="Toggle filters"
+          >
+            <FaBars size={18} color="#34495e" />
+          </button>
+          {filtersVisible && (
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ minWidth: 160 }}>
+                <Select
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option }}
+                  isMulti
+                  options={candidateOptions}
+                  value={selectedCandidates}
+                  onChange={setSelectedCandidates}
+                  placeholder="AGENTS"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                  filterOption={personFilterOption}
+                  isSearchable
+                  menuPlacement="auto"
+                  maxMenuHeight={240}
+                />
+              </div>
+              <div style={{ minWidth: 150 }}>
+                <Select
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option: DepartmentOption }}
+                  isMulti
+                  options={departments}
+                  value={selectedDepartments}
+                  onChange={setSelectedDepartments}
+                  placeholder="DEPARTMENTS"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                  isSearchable
+                  menuPlacement="auto"
+                  maxMenuHeight={280}
+                />
+              </div>
+              <div style={{ minWidth: 160 }}>
+                <Select
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option }}
+                  isMulti
+                  options={statusOptions}
+                  value={selectedStatuses}
+                  onChange={setSelectedStatuses}
+                  placeholder="STATUSES"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                />
+              </div>
+              <select
+                value={sortOrder}
+                onChange={(e) => setSortOrder(e.target.value)}
+                style={{ height: 40, width: 40, borderRadius: 10 }}
+              >
+                <option value="asc">Asc</option>
+                <option value="desc">Desc</option>
+              </select>
+            </div>
+          )}
+        </div>
+        {loading && (
+          <div style={{ display: "flex", justifyContent: "center", marginTop: 10 }}>
+            <FaSpinner className="spinning-icon" />
+          </div>
+        )}
+        <div className="grid-container" style={{
+          marginTop: 30,
+          display: "grid",
+          gap: "18px",
+          gridTemplateColumns: "repeat(5, 1fr)",
+          gridTemplateRows: "repeat(3, auto)",
+          maxWidth: 1300,
+        }}>
+          {gridCells}
+        </div>
+        <div className="pagination-container" style={{ marginTop: 20, textAlign: "center" }}>
+          <button
+            style={{
+              backgroundColor: "transparent",
+              border: "none",
+              fontSize: 24,
+              cursor: "pointer",
+              userSelect: "none",
+              padding: "0 8px",
+              color: "#fff",
+            }}
+            onClick={() =>
+              setCurrentPage((p) =>
+                p > 1
+                  ? p - 1
+                  : Math.ceil(
+                      (selectedDepartments.length > 0 && departmentRows.length > 0
+                        ? departmentRows.length
+                        : filteredCandidates.length) / CANDIDATES_PER_PAGE
+                    )
+              )
+            }
+            aria-label="Previous page"
+          >
+            {"<"}
+          </button>
+          {[...Array(
+            Math.ceil(
+              (selectedDepartments.length > 0 && departmentRows.length > 0
+                ? departmentRows.length
+                : filteredCandidates.length) / CANDIDATES_PER_PAGE
+            )
+          ).keys()].map((i) => (
+            <span
+              key={i}
+              onClick={() => setCurrentPage(i + 1)}
+              style={{
+                display: "inline-block",
+                width: 14,
+                height: 14,
+                borderRadius: "50%",
+                margin: "0 8px",
+                backgroundColor: currentPage === i + 1 ? "#007bff" : "#ccc",
+                cursor: "pointer",
+                userSelect: "none",
+                border: "none",
+                boxSizing: "border-box",
+              }}
+              aria-label={`Page ${i + 1}`}
+              role="button"
+              tabIndex={0}
+              onKeyPress={(e) => {
+                if (e.key === "Enter") setCurrentPage(i + 1);
+              }}
+            />
+          ))}
+          <button
+            style={{
+              backgroundColor: "transparent",
+              border: "none",
+              fontSize: 24,
+              cursor: "pointer",
+              userSelect: "none",
+              padding: "0 8px",
+              color: "#fff",
+            }}
+            onClick={() =>
+              setCurrentPage((p) =>
+                p <
+                Math.ceil(
+                  (selectedDepartments.length > 0 && departmentRows.length > 0
+                    ? departmentRows.length
+                    : filteredCandidates.length) / CANDIDATES_PER_PAGE
+                )
+                  ? p + 1
+                  : 1
+              )
+            }
+            aria-label="Next page"
+          >
+            {">"}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+export default TicketDashboard;
