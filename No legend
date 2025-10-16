@@ -1,0 +1,822 @@
+import React, { useEffect, useState, useMemo, useRef } from "react";
+import Select, { components } from "react-select";
+import { FaBars, FaSpinner } from "react-icons/fa";
+import "./TicketDashboard.css";
+
+const ASSIGNEE_COL_ID = 4549002565209988;
+const OPEN_STATUS_COL_ID = 1001;
+const HOLD_STATUS_COL_ID = 1003;
+const ESCALATED_STATUS_COL_ID = 1004;
+const UNASSIGNED_STATUS_COL_ID = 1005;
+const IN_PROGRESS_STATUS_COL_ID = 1006;
+
+const backendurl = "http://localhost:5000";
+const CANDIDATES_PER_PAGE = 15;
+
+const Option = (props) => (
+  <components.Option {...props}>
+    <span
+      className={`custom-checkbox${props.isSelected ? ' checked' : ''}`}
+      onClick={(e) => { e.stopPropagation(); props.selectOption(props.data); }}
+      style={{ cursor: "pointer" }}
+    ></span>
+    <span style={{ fontSize: '11px', marginLeft: 8, verticalAlign: 'middle' }}>{props.label}</span>
+  </components.Option>
+);
+
+const selectStyles = {
+  control: (base) => ({
+    ...base,
+    minWidth: 80,
+    maxWidth: 200,
+    height: 40,
+    background: "linear-gradient(145deg, #d0daf9, #a3baff)",
+    borderRadius: 18,
+    border: "1px solid #5e7ce4",
+    boxShadow:
+      "8px 8px 28px rgba(63,81,181,0.8), inset 6px 6px 14px #fff, inset -6px -6px 14px rgba(48,62,142,0.85)",
+    fontWeight: 900,
+    fontSize: 12,
+    textTransform: "uppercase",
+    fontFamily: "'Poppins',sans-serif",
+    padding: "0 1px",
+  }),
+  option: (base) => ({
+    ...base,
+    fontSize: "10px",
+    fontWeight: 900,
+  }),
+  valueContainer: (base) => ({
+    ...base,
+    paddingRight: 0,
+  }),
+  multiValue: () => ({ display: "none" }),
+  multiValueLabel: () => ({ display: "none" }),
+  menuPortal: (base) => ({ ...base, zIndex: 9999 }),
+};
+
+const getDepartmentAgentMap = (departments) => {
+  const map = {};
+  departments.forEach(dep => {
+    map[String(dep.id)] = Array.isArray(dep.agents) ? dep.agents : [];
+  });
+  map['unassigned'] = [];
+  return map;
+};
+const DepartmentOption = (props) => {
+  const [expanded, setExpanded] = useState(false);
+  const { isSelected, selectOption, label } = props;
+  const deptAgentMap = props.data.deptAgentMap || {};
+  const agentNames = deptAgentMap[String(props.data.value)] || [];
+
+  const handleExpand = (e) => {
+    e.stopPropagation();
+    setExpanded((v) => !v);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "center" }}>
+        {/* Checkbox left */}
+        <span
+          className={`custom-checkbox${isSelected ? ' checked' : ''}`}
+          onClick={(e) => { e.stopPropagation(); selectOption(props.data); }}
+          style={{ cursor: "pointer", marginRight: 6 }}
+        />
+        {/* Dept label */}
+        <span style={{ fontSize: "11px", flex: 1 }}>{label}</span>
+        {/* Arrow right */}
+        <span
+          style={{ cursor: "pointer", fontWeight: 900, fontSize: 14, marginLeft: 6 }}
+          onClick={handleExpand}
+        >
+          {expanded ? "▼" : "▶"}
+        </span>
+      </div>
+      {expanded && (
+        <div style={{
+          marginLeft: 24,
+          marginTop: 4,
+          padding: "4px 6px",
+          background: "#dae3f7",
+          borderRadius: 6,
+          color: "#222",
+          fontSize: "10px",
+        }}>
+          {agentNames.length > 0 ? agentNames.map((name, idx) => (
+            <div key={name + "_" + idx}>{name}</div>
+          )) : (
+            <div style={{ color: "#888" }}>No agents</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+async function fetchZohoDataFromBackend(setRows, setError, setUnassignedTicketNumbers) {
+  try {
+    const url = `${backendurl}/api/zoho-assignees-with-ticket-counts`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Failed to fetch Zoho assignee ticket counts");
+    const data = await response.json();
+    const rows = data.members.map((member, idx) => ({
+      cells: [
+        { columnId: ASSIGNEE_COL_ID, value: member.name },
+        { columnId: OPEN_STATUS_COL_ID, value: member.tickets.open?.toString() || "0" },
+        { columnId: HOLD_STATUS_COL_ID, value: member.tickets.hold?.toString() || "0" },
+        { columnId: ESCALATED_STATUS_COL_ID, value: member.tickets.escalated?.toString() || "0" },
+        { columnId: UNASSIGNED_STATUS_COL_ID, value: member.tickets.unassigned?.toString() || "0" },
+        { columnId: IN_PROGRESS_STATUS_COL_ID, value: member.tickets.inProgress?.toString() || "0" },
+      ],
+      departmentId: member.departmentId || member.department_id || member.deptId || null,
+      latestUnassignedTicketId: member.latestUnassignedTicketId || null,
+      key: String(member.departmentId || "no_department") + "_" + idx,
+    }));
+    setRows(rows);
+    setUnassignedTicketNumbers(data.unassignedTicketNumbers || []);
+    setError(null);
+  } catch (error) {
+    setError(error.message);
+  }
+}
+
+async function fetchZohoDepartmentTicketCounts(setDepartmentRows, setError, setUnassignedTicketNumbers, departmentIds) {
+  try {
+    if (departmentIds.length === 0) {
+      setDepartmentRows([]);
+      return;
+    }
+    const url = `${backendurl}/api/zoho-assignees-with-ticket-counts?departmentIds=${encodeURIComponent(
+      JSON.stringify(departmentIds)
+    )}`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Failed to fetch Zoho department ticket counts");
+    const data = await response.json();
+    const rows = data.members.map((member, idx) => ({
+      cells: [
+        { columnId: ASSIGNEE_COL_ID, value: member.name },
+        { columnId: OPEN_STATUS_COL_ID, value: member.tickets.open?.toString() || "0" },
+        { columnId: HOLD_STATUS_COL_ID, value: member.tickets.hold?.toString() || "0" },
+        { columnId: ESCALATED_STATUS_COL_ID, value: member.tickets.escalated?.toString() || "0" },
+        { columnId: UNASSIGNED_STATUS_COL_ID, value: member.tickets.unassigned?.toString() || "0" },
+        { columnId: IN_PROGRESS_STATUS_COL_ID, value: member.tickets.inProgress?.toString() || "0" },
+      ],
+      departmentId: member.departmentId || member.department_id || member.deptId || null,
+      latestUnassignedTicketId: member.latestUnassignedTicketId || null,
+      key: String(member.departmentId || "no_department") + "_" + idx,
+    }));
+    setDepartmentRows(rows);
+    setUnassignedTicketNumbers(data.unassignedTicketNumbers || []);
+    setError(null);
+  } catch (error) {
+    setError(error.message);
+  }
+}
+
+async function fetchDepartmentTicketCountsSummary(setDepartmentSummaryRows, setError) {
+  try {
+    const response = await fetch(`${backendurl}/api/zoho-department-ticket-counts`);
+    if (!response.ok) throw new Error("Failed to fetch department ticket counts");
+    const data = await response.json();
+    const seen = new Set();
+    const rows = data.departmentTicketCounts
+      .filter(dep => {
+        if (seen.has(dep.id)) return false;
+        seen.add(dep.id);
+        return true;
+      })
+      .map((dep, idx) => ({
+        cells: [
+          { columnId: ASSIGNEE_COL_ID, value: dep.name },
+          { columnId: OPEN_STATUS_COL_ID, value: dep.tickets.open?.toString() || "0" },
+          { columnId: HOLD_STATUS_COL_ID, value: dep.tickets.hold?.toString() || "0" },
+          { columnId: ESCALATED_STATUS_COL_ID, value: dep.tickets.escalated?.toString() || "0" },
+          { columnId: UNASSIGNED_STATUS_COL_ID, value: dep.tickets.unassigned?.toString() || "0" },
+          { columnId: IN_PROGRESS_STATUS_COL_ID, value: dep.tickets.inProgress?.toString() || "0" },
+        ],
+        latestUnassignedTicketId: null,
+        key: String(dep.id) + "_" + idx,
+      }));
+    setDepartmentSummaryRows(rows);
+    setError(null);
+  } catch (error) {
+    setError(error.message);
+  }
+}
+
+function TicketDashboard() {
+  const hasFetchedRef = useRef(false);
+  const [rows, setRows] = useState(() => {
+    const saved = localStorage.getItem("ticketDashboardRows");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [departmentRows, setDepartmentRows] = useState(() => {
+    const saved = localStorage.getItem("departmentRows");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [departmentSummaryRows, setDepartmentSummaryRows] = useState(() => {
+    const saved = localStorage.getItem("departmentSummaryRows");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [error, setError] = useState(null);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [selectedCandidates, setSelectedCandidates] = useState(() => {
+    const saved = localStorage.getItem("selectedCandidates");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [selectedStatuses, setSelectedStatuses] = useState(() => {
+    const saved = localStorage.getItem("selectedStatuses");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [selectedDepartments, setSelectedDepartments] = useState(() => {
+    const saved = localStorage.getItem("selectedDepartments");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [currentPage, setCurrentPage] = useState(1);
+  const [sortOrder, setSortOrder] = useState("asc");
+  const [openSum, setOpenSum] = useState(() => {
+    const saved = localStorage.getItem("openSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [holdSum, setHoldSum] = useState(() => {
+    const saved = localStorage.getItem("holdSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [escalatedSum, setEscalatedSum] = useState(() => {
+    const saved = localStorage.getItem("escalatedSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [inProgressSum, setInProgressSum] = useState(() => {
+    const saved = localStorage.getItem("inProgressSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [globalUnassignedSum, setGlobalUnassignedSum] = useState(() => {
+    const saved = localStorage.getItem("globalUnassignedSum");
+    return saved !== null ? JSON.parse(saved) : null;
+  });
+  const [unassignedTicketNumbers, setUnassignedTicketNumbers] = useState(() => {
+    const saved = localStorage.getItem("unassignedTicketNumbers");
+    return saved ? JSON.parse(saved) : [];
+  });
+  useEffect(() => {
+    localStorage.setItem("unassignedTicketNumbers", JSON.stringify(unassignedTicketNumbers));
+  }, [unassignedTicketNumbers]);
+
+  const [currentUnassignedIndex, setCurrentUnassignedIndex] = useState(0);
+  const [filtersVisible, setFiltersVisible] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [departments, setDepartments] = useState([]);
+  const [filteredCandidates, setFilteredCandidates] = useState([]);
+  const statusOptions = [
+    { value: "open", label: "Open" },
+    { value: "hold", label: "Hold" },
+    { value: "inProgress", label: "In Progress" },
+    { value: "escalated", label: "Escalated" },
+    { value: "unassigned", label: "Unassigned" },
+    { value: "total", label: "Total" },
+  ];
+
+  async function refreshData() {
+    try {
+      setLoading(true);
+      await fetchZohoDataFromBackend(setRows, setError, setUnassignedTicketNumbers);
+      await fetchDepartmentTicketCountsSummary(setDepartmentSummaryRows, setError);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    localStorage.setItem("ticketDashboardRows", JSON.stringify(rows));
+  }, [rows]);
+  useEffect(() => {
+    localStorage.setItem("departmentRows", JSON.stringify(departmentRows));
+  }, [departmentRows]);
+  useEffect(() => {
+    localStorage.setItem("departmentSummaryRows", JSON.stringify(departmentSummaryRows));
+  }, [departmentSummaryRows]);
+  useEffect(() => {
+    localStorage.setItem("selectedCandidates", JSON.stringify(selectedCandidates));
+  }, [selectedCandidates]);
+  useEffect(() => {
+    localStorage.setItem("selectedStatuses", JSON.stringify(selectedStatuses));
+  }, [selectedStatuses]);
+  useEffect(() => {
+    localStorage.setItem("selectedDepartments", JSON.stringify(selectedDepartments));
+  }, [selectedDepartments]);
+  useEffect(() => {
+    if (openSum !== null) localStorage.setItem("openSum", JSON.stringify(openSum));
+  }, [openSum]);
+  useEffect(() => {
+    if (holdSum !== null) localStorage.setItem("holdSum", JSON.stringify(holdSum));
+  }, [holdSum]);
+  useEffect(() => {
+    if (escalatedSum !== null) localStorage.setItem("escalatedSum", JSON.stringify(escalatedSum));
+  }, [escalatedSum]);
+  useEffect(() => {
+    if (inProgressSum !== null) localStorage.setItem("inProgressSum", JSON.stringify(inProgressSum));
+  }, [inProgressSum]);
+  useEffect(() => {
+    if (globalUnassignedSum !== null) localStorage.setItem("globalUnassignedSum", JSON.stringify(globalUnassignedSum));
+  }, [globalUnassignedSum]);
+
+  useEffect(() => {
+    if (selectedDepartments.length > 0) {
+      const ids = selectedDepartments.map((dep) => dep.value);
+      fetchZohoDepartmentTicketCounts(setDepartmentRows, setError, setUnassignedTicketNumbers, ids);
+    } else {
+      setDepartmentRows([]);
+    }
+  }, [selectedDepartments]);
+
+  useEffect(() => {
+    if (!hasFetchedRef.current) {
+      refreshData();
+      hasFetchedRef.current = true;
+    }
+    const dataInterval = setInterval(() => refreshData(), 300000);
+    const reloadInterval = setInterval(() => window.location.reload(), 300000);
+    return () => {
+      clearInterval(dataInterval);
+      clearInterval(reloadInterval);
+    };
+  }, []);
+
+  useEffect(() => {
+    fetch(`${backendurl}/api/zoho-departments`)
+      .then((res) => res.json())
+      .then((data) => {
+        const deptOptionsRaw = (data.departments || []);
+        const deptAgentMapRaw = getDepartmentAgentMap(deptOptionsRaw);
+        const deptOptions = [
+          ...deptOptionsRaw.map((dep, idx) => ({
+            value: String(dep.id),
+            label: `${dep.name}${typeof dep.showInPortal !== 'undefined'
+              ? (dep.showInPortal ? ' (Portal: Yes)' : ' (Portal: No)')
+              : dep.status ? ` (${dep.status})` : ''}`,
+            key: String(dep.id) + "_" + idx,
+            deptAgentMap: deptAgentMapRaw,
+          })),
+          {
+            value: "unassigned",
+            label: "Unassigned Agents",
+            key: "unassigned_dept",
+            deptAgentMap: deptAgentMapRaw,
+          }
+        ];
+        setDepartments(deptOptions);
+      });
+  }, []);
+
+  useEffect(() => {
+    let total = 0;
+    rows.forEach((row) => {
+      const cell = row.cells.find((cell) => cell.columnId === UNASSIGNED_STATUS_COL_ID);
+      if (cell) total += Number(cell.value || 0);
+    });
+    setGlobalUnassignedSum(rows.length === 0 ? null : total);
+  }, [rows]);
+
+  useEffect(() => {
+    if (unassignedTicketNumbers.length > 0) {
+      const interval = setInterval(() => {
+        setCurrentUnassignedIndex((prev) => (prev + 1) % unassignedTicketNumbers.length);
+      }, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [unassignedTicketNumbers]);
+
+  const nonZeroRows = useMemo(() => rows, [rows]);
+  const candidateOptions = useMemo(() => {
+    const validNames = [];
+    nonZeroRows.forEach((row) => {
+      const name = row.cells.find((c) => c.columnId === ASSIGNEE_COL_ID)?.value?.trim();
+      const ticketCounts = row.cells
+        .filter((cell) =>
+          [
+            OPEN_STATUS_COL_ID,
+            HOLD_STATUS_COL_ID,
+            ESCALATED_STATUS_COL_ID,
+            UNASSIGNED_STATUS_COL_ID,
+            IN_PROGRESS_STATUS_COL_ID,
+          ].includes(cell.columnId)
+        )
+        .map((cell) => Number(cell.value) || 0);
+      if (name && ticketCounts.some((count) => count > 0)) {
+        validNames.push(name);
+      }
+    });
+    return Array.from(new Set(validNames))
+      .sort()
+      .map((name) => ({ value: name, label: name }));
+  }, [nonZeroRows]);
+
+  const selectedStatusKeys = useMemo(
+    () =>
+      selectedStatuses.length > 0
+        ? selectedStatuses.map((s) => s.value)
+        : statusOptions.map((s) => s.value),
+    [selectedStatuses]
+  );
+
+  const personFilterOption = (option, inputValue) => {
+    if (!inputValue) return true;
+    if (selectedCandidates.find((sel) => sel.value === option.value)) return true;
+    return option.label.toLowerCase().includes(inputValue.toLowerCase());
+  };
+
+  const [gridCells, setGridCells] = useState([]);
+  const intervalRef = useRef(null);
+  useEffect(() => {
+    // --- Unified department + agent filtering logic ---
+    let dataSource = [];
+    if (selectedDepartments.length > 0 && departmentRows.length > 0) {
+      dataSource = departmentRows;
+    } else {
+      dataSource = rows;
+    }
+
+    let filteredRows = dataSource;
+
+    if (selectedDepartments.length > 0) {
+      const allowedDeptIds = selectedDepartments.map(dep => String(dep.value));
+      filteredRows = filteredRows.filter(row =>
+        allowedDeptIds.includes(String(row.departmentId))
+      );
+    }
+
+    if (selectedCandidates.length > 0) {
+      const allowedNames = selectedCandidates.map((c) => c.value.trim().toLowerCase());
+      filteredRows = filteredRows.filter(row =>
+        allowedNames.includes(row.cells.find(cell => cell.columnId === ASSIGNEE_COL_ID)?.value?.trim().toLowerCase())
+      );
+    }
+
+    const displayRows = filteredRows.map(row => [
+      row.cells.find(cell => cell.columnId === ASSIGNEE_COL_ID)?.value,
+      {
+        open: Number(row.cells.find((cell) => cell.columnId === OPEN_STATUS_COL_ID)?.value || 0),
+        hold: Number(row.cells.find((cell) => cell.columnId === HOLD_STATUS_COL_ID)?.value || 0),
+        escalated: Number(row.cells.find((cell) => cell.columnId === ESCALATED_STATUS_COL_ID)?.value || 0),
+        unassigned: Number(row.cells.find((cell) => cell.columnId === UNASSIGNED_STATUS_COL_ID)?.value || 0),
+        inProgress: Number(row.cells.find((cell) => cell.columnId === IN_PROGRESS_STATUS_COL_ID)?.value || 0),
+        latestUnassignedTicketId: row.latestUnassignedTicketId || null,
+      }
+    ]);
+
+    const sortedFiltered = [...displayRows].sort((a, b) => {
+      if (a[0] < b[0]) return sortOrder === "asc" ? -1 : 1;
+      if (a[0] > b[0]) return sortOrder === "asc" ? 1 : -1;
+      return 0;
+    });
+
+    const nonZeroFiltered = sortedFiltered.filter(
+      ([_, counts]) =>
+        counts.open > 0 ||
+        counts.hold > 0 ||
+        counts.escalated > 0 ||
+        counts.unassigned > 0 ||
+        counts.inProgress > 0
+    );
+
+    const totalPages = Math.ceil(nonZeroFiltered.length / CANDIDATES_PER_PAGE);
+    if (currentPage > totalPages && totalPages > 0) setCurrentPage(1);
+    const start = (currentPage - 1) * CANDIDATES_PER_PAGE;
+    const end = Math.min(start + CANDIDATES_PER_PAGE, nonZeroFiltered.length);
+
+    const cells = [];
+    for (let i = start; i < end; i++) {
+      const [candidate, counts] = nonZeroFiltered[i];
+      const totalSelected = selectedStatusKeys.includes("total");
+      const selectedStatusesExcludingTotal = selectedStatusKeys.filter((k) => k !== "total");
+      const sumSelectedStatuses = selectedStatusesExcludingTotal.reduce(
+        (sum, key) => sum + (counts[key] || 0),
+        0
+      );
+      const showSumOnly = totalSelected && selectedStatusesExcludingTotal.length > 0;
+      cells.push(
+        <div key={candidate} className="grid-cell" style={{ animationDelay: `${(i - start) * 65}ms` }}>
+          <div className="candidate-name">{candidate}</div>
+          <div className="ticket-counts" style={{ justifyContent: "center", display: "flex", gap: 10 }}>
+            {showSumOnly ? (
+              <div className="count-box total">{sumSelectedStatuses}</div>
+            ) : selectedStatusesExcludingTotal.length > 0 ? (
+              <>
+                {selectedStatusKeys.includes("open") && (
+                  <div className="count-box open">{counts.open}</div>
+                )}
+                {selectedStatusKeys.includes("hold") && (
+                  <div className="count-box hold">{counts.hold}</div>
+                )}
+                {selectedStatusKeys.includes("inProgress") && (
+                  <div className="count-box inprogress">{counts.inProgress}</div>
+                )}
+                {selectedStatusKeys.includes("escalated") && (
+                  <div className="count-box escalated">{counts.escalated}</div>
+                )}
+                {selectedStatusKeys.includes("unassigned") && (
+                  <div
+                    className="count-box unassigned"
+                    style={{
+                      backgroundColor:
+                        counts.latestUnassignedTicketId === unassignedTicketNumbers[currentUnassignedIndex]
+                          ? "#ffd700"
+                          : "#bd2331",
+                      color:
+                        counts.latestUnassignedTicketId === unassignedTicketNumbers[currentUnassignedIndex]
+                          ? "#34495e"
+                          : "#fff",
+                      fontWeight:
+                        counts.latestUnassignedTicketId === unassignedTicketNumbers[currentUnassignedIndex]
+                          ? 900
+                          : 700,
+                    }}
+                  >
+                    {counts.unassigned}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="count-box total">
+                {counts.open + counts.hold + counts.escalated + counts.unassigned + counts.inProgress}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+    setGridCells(cells);
+  }, [
+    filteredCandidates,
+    currentPage,
+    sortOrder,
+    selectedStatusKeys,
+    unassignedTicketNumbers,
+    currentUnassignedIndex,
+    selectedDepartments,
+    departmentRows,
+    rows,
+    selectedCandidates // <-- critical
+  ]);
+
+  useEffect(() => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    const rowCount =
+      selectedDepartments.length > 0 && departmentRows.length > 0
+        ? departmentRows.length
+        : filteredCandidates.length;
+    const totalPages = Math.ceil(rowCount / CANDIDATES_PER_PAGE);
+    if (totalPages > 1) {
+      intervalRef.current = setInterval(() => {
+        setCurrentPage((prev) => (prev < totalPages ? prev + 1 : 1));
+      }, 5000); // 5 seconds page auto-change
+    }
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [filteredCandidates, departmentRows, selectedDepartments]);
+
+  const showLegendTotal = selectedStatuses.some((s) => s.value === "total");
+  const currentTicketNumber =
+    unassignedTicketNumbers.length > 0
+      ? unassignedTicketNumbers[currentUnassignedIndex].toString().padStart(5, "0")
+      : "00000";
+
+  return (
+    <>
+      <div className="dashboard-header-main" style={{ maxWidth: 1300, margin: "0 auto 30px auto", position: "relative" }}>
+        {/* ...header and legends unchanged... */}
+        <div className="dashboard-header-top" style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          position: "relative",
+        }}>
+          <img className="header-image" src="/suprajit_logo_BG.png" alt="Left icon" style={{ height: 80, width: "auto" }} />
+          <div className="dashboard-title-container" style={{
+            fontWeight: 900,
+            fontSize: 60,
+            letterSpacing: 2,
+            color: "#e0eaff",
+            textShadow: "2px 2px 6px rgba(0, 0, 50, 0.7)",
+            userSelect: "none",
+            textTransform: "uppercase",
+            position: "relative",
+            zIndex: 2,
+          }}>
+            TICKET DASHBOARD
+          </div>
+          <div style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-end",
+            gap: 10,
+            position: "relative",
+            zIndex: 2,
+          }}>
+            <img className="header-image" src="/IT-LOGO.png" alt="Right icon" style={{ height: 70, width: "auto" }} />
+          </div>
+        </div>
+        <div className="dashboard-header-filters" style={{
+          maxWidth: 1400,
+          margin: "0 auto",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          width: "100%",
+        }}>
+          <div style={{ height: 40 }} />
+          <div className="legend-bar" style={{
+            display: "flex",
+            gap: 10,
+            flex: filtersVisible ? "initial" : 1,
+            transition: "flex 0.3s ease",
+          }}>
+            {/* ...legend cells unchanged... */}
+            {/* ...total legend unchanged... */}
+          </div>
+          <button
+            className="hamburger-btn"
+            style={{
+              width: 30,
+              height: 30,
+              borderRadius: 10,
+              border: "none",
+              cursor: "pointer",
+              marginLeft: 20,
+              display: "block",
+            }}
+            onClick={() => setFiltersVisible((v) => !v)}
+            aria-label="Toggle filters"
+          >
+            <FaBars size={18} color="#34495e" />
+          </button>
+          {filtersVisible && (
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ minWidth: 160 }}>
+                <Select
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option }}
+                  isMulti
+                  options={candidateOptions}
+                  value={selectedCandidates}
+                  onChange={setSelectedCandidates}
+                  placeholder="AGENTS"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                  filterOption={personFilterOption}
+                  isSearchable
+                  menuPlacement="auto"
+                  maxMenuHeight={240}
+                />
+              </div>
+              <div style={{ minWidth: 150 }}>
+                <Select
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option: DepartmentOption }}
+                  isMulti
+                  options={departments}
+                  value={selectedDepartments}
+                  onChange={setSelectedDepartments}
+                  placeholder="DEPARTMENTS"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                  isSearchable
+                  menuPlacement="auto"
+                  maxMenuHeight={280}
+                />
+              </div>
+              <div style={{ minWidth: 160 }}>
+                <Select
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option }}
+                  isMulti
+                  options={statusOptions}
+                  value={selectedStatuses}
+                  onChange={setSelectedStatuses}
+                  placeholder="STATUSES"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                />
+              </div>
+              <select
+                value={sortOrder}
+                onChange={(e) => setSortOrder(e.target.value)}
+                style={{ height: 40, width: 40, borderRadius: 10 }}
+              >
+                <option value="asc">Asc</option>
+                <option value="desc">Desc</option>
+              </select>
+            </div>
+          )}
+        </div>
+        {loading && (
+          <div style={{ display: "flex", justifyContent: "center", marginTop: 10 }}>
+            <FaSpinner className="spinning-icon" />
+          </div>
+        )}
+        <div className="grid-container" style={{
+          marginTop: 30,
+          display: "grid",
+          gap: "18px",
+          gridTemplateColumns: "repeat(5, 1fr)",
+          gridTemplateRows: "repeat(3, auto)",
+          maxWidth: 1300,
+        }}>
+          {gridCells}
+        </div>
+        <div className="pagination-container" style={{ marginTop: 20, textAlign: "center" }}>
+          <button
+            style={{
+              backgroundColor: "transparent",
+              border: "none",
+              fontSize: 24,
+              cursor: "pointer",
+              userSelect: "none",
+              padding: "0 8px",
+              color: "#fff",
+            }}
+            onClick={() =>
+              setCurrentPage((p) =>
+                p > 1
+                  ? p - 1
+                  : Math.ceil(
+                      (selectedDepartments.length > 0 && departmentRows.length > 0
+                        ? departmentRows.length
+                        : filteredCandidates.length) / CANDIDATES_PER_PAGE
+                    )
+              )
+            }
+            aria-label="Previous page"
+          >
+            {"<"}
+          </button>
+          {[...Array(
+            Math.ceil(
+              (selectedDepartments.length > 0 && departmentRows.length > 0
+                ? departmentRows.length
+                : filteredCandidates.length) / CANDIDATES_PER_PAGE
+            )
+          ).keys()].map((i) => (
+            <span
+              key={i}
+              onClick={() => setCurrentPage(i + 1)}
+              style={{
+                display: "inline-block",
+                width: 14,
+                height: 14,
+                borderRadius: "50%",
+                margin: "0 8px",
+                backgroundColor: currentPage === i + 1 ? "#007bff" : "#ccc",
+                cursor: "pointer",
+                userSelect: "none",
+                border: "none",
+                boxSizing: "border-box",
+              }}
+              aria-label={`Page ${i + 1}`}
+              role="button"
+              tabIndex={0}
+              onKeyPress={(e) => {
+                if (e.key === "Enter") setCurrentPage(i + 1);
+              }}
+            />
+          ))}
+          <button
+            style={{
+              backgroundColor: "transparent",
+              border: "none",
+              fontSize: 24,
+              cursor: "pointer",
+              userSelect: "none",
+              padding: "0 8px",
+              color: "#fff",
+            }}
+            onClick={() =>
+              setCurrentPage((p) =>
+                p <
+                Math.ceil(
+                  (selectedDepartments.length > 0 && departmentRows.length > 0
+                    ? departmentRows.length
+                    : filteredCandidates.length) / CANDIDATES_PER_PAGE
+                )
+                  ? p + 1
+                  : 1
+              )
+            }
+            aria-label="Next page"
+          >
+            {">"}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+export default TicketDashboard;
