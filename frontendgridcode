@@ -1,0 +1,1001 @@
+import React, { useEffect, useState, useMemo, useRef } from "react";
+import Select, { components } from "react-select";
+import { FaBars, FaSpinner } from "react-icons/fa";
+import "./TicketDashboard.css";
+
+const ASSIGNEE_COL_ID = 4549002565209988;
+const OPEN_STATUS_COL_ID = 1001;
+const HOLD_STATUS_COL_ID = 1003;
+const ESCALATED_STATUS_COL_ID = 1004;
+const UNASSIGNED_STATUS_COL_ID = 1005;
+const IN_PROGRESS_STATUS_COL_ID = 1006;
+
+const backendurl = "http://localhost:5000";
+const CANDIDATES_PER_PAGE = 15;
+
+const Option = (props) => (
+  <components.Option {...props}>
+    <span
+      className={`custom-checkbox${props.isSelected ? " checked" : ""}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        props.selectOption(props.data);
+      }}
+      style={{ cursor: "pointer" }}
+    />
+    <span style={{ fontSize: "11px", marginLeft: 8, verticalAlign: "middle" }}>
+      {props.label}
+    </span>
+  </components.Option>
+);
+
+const selectStyles = {
+  control: (base) => ({
+    ...base,
+    minWidth: 80,
+    maxWidth: 200,
+    height: 40,
+    background: "linear-gradient(145deg, #d0daf9, #a3baff)",
+    borderRadius: 18,
+    border: "1px solid #5e7ce4",
+    boxShadow:
+      "8px 8px 28px rgba(63,81,181,0.8), inset 6px 6px 14px #fff, inset -6px -6px 14px rgba(48,62,142,0.85)",
+    fontWeight: 900,
+    fontSize: 12,
+    textTransform: "uppercase",
+    fontFamily: "'Poppins',sans-serif",
+    padding: "0 1px",
+  }),
+  option: (base) => ({
+    ...base,
+    fontSize: "10px",
+    fontWeight: 900,
+  }),
+  valueContainer: (base) => ({
+    ...base,
+    paddingRight: 0,
+  }),
+  multiValue: () => ({ display: "none" }),
+  multiValueLabel: () => ({ display: "none" }),
+  menuPortal: (base) => ({ ...base, zIndex: 9999 }),
+};
+
+const DepartmentOption = (props) => {
+  const [expanded, setExpanded] = useState(false);
+  const { isSelected, selectOption, label } = props;
+  const deptAgentMap = props.data.deptAgentMap || {};
+  const agentNames = deptAgentMap[String(props.data.value)] || [];
+  const handleExpand = (e) => {
+    e.stopPropagation();
+    setExpanded((v) => !v);
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "center" }}>
+        <span
+          className={`custom-checkbox${isSelected ? " checked" : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            selectOption(props.data);
+          }}
+          style={{ cursor: "pointer", marginRight: 6 }}
+        />
+        <span style={{ fontSize: "11px", flex: 1 }}>{label}</span>
+        <span
+          style={{
+            cursor: "pointer",
+            fontWeight: 900,
+            fontSize: 14,
+            marginLeft: 6,
+          }}
+          onClick={handleExpand}
+        >
+          {expanded ? "▼" : "▶"}
+        </span>
+      </div>
+      {expanded && (
+        <div
+          style={{
+            marginLeft: 24,
+            marginTop: 4,
+            padding: "4px 6px",
+            background: "#dae3f7",
+            borderRadius: 6,
+            color: "#222",
+            fontSize: "10px",
+          }}
+        >
+          {agentNames.length > 0 ? (
+            agentNames.map((name, idx) => <div key={name + "_" + idx}>{name}</div>)
+          ) : (
+            <div style={{ color: "#888" }}>No agents</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+function getAgentDisplayCount(counts, selectedStatusKeys) {
+  const selectedStatusesExcludingTotal = selectedStatusKeys.filter((k) => k !== "total");
+  const showSumOnly = selectedStatusKeys.includes("total") && selectedStatusesExcludingTotal.length > 0;
+  const sumSelectedStatuses = selectedStatusesExcludingTotal.reduce(
+    (sum, key) => sum + (counts[key] || 0),
+    0
+  );
+  if (showSumOnly) return sumSelectedStatuses;
+  if (selectedStatusesExcludingTotal.length > 0)
+    return selectedStatusesExcludingTotal.map((key) => counts[key] || 0).join(" / ");
+  return counts.open + counts.hold + counts.escalated + counts.unassigned + counts.inProgress;
+}
+
+function TicketDashboard() {
+  const getStoredTicketNumber = () => {
+    const saved = localStorage.getItem("latestUnassignedTicketNumber");
+    return saved ? saved.toString().padStart(5, "0") : "00000";
+  };
+  
+
+  const [rows, setRows] = useState(() => {
+    const saved = localStorage.getItem("ticketDashboardRows");
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  const [departmentsList, setDepartmentsList] = useState([]);
+  const [membersData, setMembersData] = useState([]);
+  const [departmentMembersMap, setDepartmentMembersMap] = useState(() => {
+    const saved = localStorage.getItem("departmentMembersMap");
+    return saved ? JSON.parse(saved) : {};
+  });
+
+  const [selectedDepartments, setSelectedDepartments] = useState([]);
+  const [currentDeptPage, setCurrentDeptPage] = useState(1);
+
+  const [selectedCandidates, setSelectedCandidates] = useState([]);
+  const [selectedStatuses, setSelectedStatuses] = useState([]);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [sortOrder, setSortOrder] = useState("asc");
+  const [loading, setLoading] = useState(false);
+  const [filtersVisible, setFiltersVisible] = useState(false);
+  const [unassignedTicketNumbers, setUnassignedTicketNumbers] = useState([]);
+  const [currentUnassignedIndex, setCurrentUnassignedIndex] = useState(0);
+  const [openSum, setOpenSum] = useState(null);
+  const [holdSum, setHoldSum] = useState(null);
+  const [escalatedSum, setEscalatedSum] = useState(null);
+  const [inProgressSum, setInProgressSum] = useState(null);
+  const [globalUnassignedSum, setGlobalUnassignedSum] = useState(null);
+  const [filteredCandidates, setFilteredCandidates] = useState([]);
+  const [departmentRows, setDepartmentRows] = useState([]);
+  const [departmentSummaryRows, setDepartmentSummaryRows] = useState([]);
+  const [error, setError] = useState(null);
+  const currentTicketNumber =
+    unassignedTicketNumbers.length > 0
+      ? unassignedTicketNumbers[currentUnassignedIndex].toString().padStart(5, "0")
+      : getStoredTicketNumber();
+      const hasFetchedRef = useRef(false);
+  const showLegendTotal = useMemo(() => 
+  selectedStatuses.some(s => s.value === 'total'),
+  [selectedStatuses]
+);
+
+
+  const statusOptions = [
+    { value: "open", label: "Open" },
+    { value: "hold", label: "Hold" },
+    { value: "inProgress", label: "In Progress" },
+    { value: "escalated", label: "Escalated" },
+    { value: "unassigned", label: "Unassigned" },
+    { value: "total", label: "Total" },
+  ];
+
+  // Departments fetch and caching
+  useEffect(() => {
+    async function refreshDepartments() {
+      try {
+        const res = await fetch(`${backendurl}/api/zoho-departments`);
+        if (res.ok) {
+          const data = await res.json();
+          setDepartmentsList(data.departments || []);
+          localStorage.setItem("departmentsList", JSON.stringify(data.departments || []));
+        }
+      } catch (err) {}
+    }
+    refreshDepartments();
+  }, []);
+
+  // Fetch all department agents and cache
+  useEffect(() => {
+    async function fetchMembersForDepartments(departments) {
+      setLoading(true);
+      const map = {};
+      for (const dept of departments) {
+        try {
+          const resp = await fetch(`${backendurl}/api/department-members/${dept.id}`);
+          if (!resp.ok) throw new Error("Failed to fetch department members");
+          const data = await resp.json();
+          map[dept.id] = data.members.map(
+            (m) => m.displayName || m.fullName || m.name || m.email || "Unknown"
+          );
+        } catch {
+          map[dept.id] = departmentMembersMap[dept.id] || [];
+        }
+      }
+      setDepartmentMembersMap(prevMap => {
+        const updated = { ...prevMap, ...map };
+        localStorage.setItem("departmentMembersMap", JSON.stringify(updated));
+        return updated;
+      });
+      setLoading(false);
+    }
+    if (departmentsList.length > 0) fetchMembersForDepartments(departmentsList);
+    // eslint-disable-next-line
+  }, [departmentsList]);
+
+  // Dashboard data fetch, caching, and status summary
+  const fetchDashboardData = async () => {
+    if (hasFetchedRef.current) return;
+    hasFetchedRef.current = true;
+    setLoading(true);
+    try {
+      const res = await fetch(`${backendurl}/api/zoho-assignees-with-ticket-counts`);
+      if (res.ok) {
+        const data = await res.json();
+        setMembersData(data.members || []);
+        setUnassignedTicketNumbers(data.unassignedTicketNumbers || []);
+        localStorage.setItem("ticketDashboardRows", JSON.stringify(data.members || []));
+        localStorage.setItem("unassignedTicketNumbers", JSON.stringify(data.unassignedTicketNumbers || []));
+      }
+    } catch (err) {}
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchDashboardData();
+    const intervalId = setInterval(fetchDashboardData, 300000);
+    return () => clearInterval(intervalId);
+  }, []);
+
+  useEffect(() => {
+    const reloadInterval = setInterval(() => {
+      window.location.reload();
+    }, 300000);
+    return () => clearInterval(reloadInterval);
+  }, []);
+
+  // Persist the latest unassigned ticket number in localStorage
+  useEffect(() => {
+    if (unassignedTicketNumbers.length > 0) {
+      const latestTicketNum =
+        unassignedTicketNumbers[currentUnassignedIndex] || unassignedTicketNumbers[0];
+      localStorage.setItem("latestUnassignedTicketNumber", latestTicketNum);
+    }
+  }, [unassignedTicketNumbers, currentUnassignedIndex]);
+
+  // Helper to get previous/latest ticket number if API data has not loaded yet
+  // const getStoredTicketNumber = () => {
+  //   const saved = localStorage.getItem("latestUnassignedTicketNumber");
+  //   return saved ? saved.toString().padStart(5, "0") : "00000";
+  // };
+  useEffect(() => {
+   async function fetchMembersForDepartments(departments) {
+  const map = {};
+  for (const dept of departments) {
+    try {
+      const resp = await fetch(`${backendurl}/api/department-members/${dept.id}`);
+      if (!resp.ok) throw new Error("Failed to fetch department members");
+      const data = await resp.json();
+      map[dept.id] = data.members.map(
+        (m) => m.displayName || m.fullName || m.name || m.email || "Unknown"
+      );
+    } catch {
+      map[dept.id] = [];
+    }
+  }
+  // INSTEAD OF setDepartmentMembersMap(map), do:
+  setDepartmentMembersMap(prevMap => {
+    const updated = { ...prevMap, ...map };
+    localStorage.setItem("departmentMembersMap", JSON.stringify(updated));
+    return updated;
+  });
+}
+
+    if (departmentsList.length > 0) fetchMembersForDepartments(departmentsList);
+  }, [departmentsList]);
+
+  useEffect(() => {
+    if (unassignedTicketNumbers.length > 0) {
+      const interval = setInterval(() => {
+        setCurrentUnassignedIndex(
+          (prev) => (prev + 1) % unassignedTicketNumbers.length
+        );
+      }, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [unassignedTicketNumbers]);
+
+  useEffect(() => {
+    if (!membersData || membersData.length === 0) return;
+    const newRows = membersData.map((member) => ({
+      cells: [
+        { columnId: ASSIGNEE_COL_ID, value: member.name },
+        { columnId: OPEN_STATUS_COL_ID, value: (member.tickets.open || 0).toString() },
+        { columnId: HOLD_STATUS_COL_ID, value: (member.tickets.hold || 0).toString() },
+        { columnId: ESCALATED_STATUS_COL_ID, value: (member.tickets.escalated || 0).toString() },
+        { columnId: UNASSIGNED_STATUS_COL_ID, value: (member.tickets.unassigned || 0).toString() },
+        { columnId: IN_PROGRESS_STATUS_COL_ID, value: (member.tickets.inProgress || 0).toString() },
+      ],
+      departmentIds: member.departmentIds || [],
+      latestUnassignedTicketId: member.latestUnassignedTicketId || null,
+      key: (member.departmentIds ? member.departmentIds.join(",") : "no_department") + "_" + member.id,
+    }));
+    setRows(newRows);
+    localStorage.setItem("ticketDashboardRows", JSON.stringify(newRows));
+  }, [membersData]);
+
+  useEffect(() => {
+    localStorage.setItem("selectedDepartments", JSON.stringify(selectedDepartments));
+    localStorage.setItem("selectedCandidates", JSON.stringify(selectedCandidates));
+    localStorage.setItem("selectedStatuses", JSON.stringify(selectedStatuses));
+    localStorage.setItem("departmentRows", JSON.stringify(departmentRows));
+    localStorage.setItem("departmentSummaryRows", JSON.stringify(departmentSummaryRows));
+  }, [
+    selectedDepartments,
+    selectedCandidates,
+    selectedStatuses,
+    departmentRows,
+    departmentSummaryRows,
+  ]);
+
+  useEffect(() => {
+    let open = 0,
+      hold = 0,
+      escalated = 0,
+      inProgress = 0,
+      unassigned = 0;
+    rows.forEach((row) => {
+      row.cells.forEach((cell) => {
+        if (cell.columnId === OPEN_STATUS_COL_ID) open += Number(cell.value || 0);
+        if (cell.columnId === HOLD_STATUS_COL_ID) hold += Number(cell.value || 0);
+        if (cell.columnId === ESCALATED_STATUS_COL_ID) escalated += Number(cell.value || 0);
+        if (cell.columnId === IN_PROGRESS_STATUS_COL_ID) inProgress += Number(cell.value || 0);
+        if (cell.columnId === UNASSIGNED_STATUS_COL_ID) unassigned += Number(cell.value || 0);
+      });
+    });
+    setOpenSum(open);
+    setHoldSum(hold);
+    setEscalatedSum(escalated);
+    setInProgressSum(inProgress);
+    setGlobalUnassignedSum(unassigned);
+  }, [rows]);
+  const candidateOptions = useMemo(() => {
+    const validNames = [];
+    rows.forEach((row) => {
+      const name = row.cells.find((c) => c.columnId === ASSIGNEE_COL_ID)?.value?.trim();
+      const ticketCounts = row.cells
+        .filter((cell) =>
+          [
+            OPEN_STATUS_COL_ID,
+            HOLD_STATUS_COL_ID,
+            ESCALATED_STATUS_COL_ID,
+            UNASSIGNED_STATUS_COL_ID,
+            IN_PROGRESS_STATUS_COL_ID,
+          ].includes(cell.columnId)
+        )
+        .map((cell) => Number(cell.value) || 0);
+      if (name && ticketCounts.some((count) => count > 0)) validNames.push(name);
+    });
+    return Array.from(new Set(validNames))
+      .sort()
+      .map((name) => ({ value: name, label: name }));
+  }, [rows]);
+
+  const selectedStatusKeys = useMemo(
+    () =>
+      selectedStatuses.length > 0
+        ? selectedStatuses.map((s) => s.value)
+        : statusOptions.map((s) => s.value),
+    [selectedStatuses]
+  );
+
+  const personFilterOption = (option, inputValue) => {
+    if (!inputValue) return true;
+    if (selectedCandidates.find((sel) => sel.value === option.value)) return true;
+    return option.label.toLowerCase().includes(inputValue.toLowerCase());
+  };
+
+  const [gridCells, setGridCells] = useState([]);
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    let dataSource = rows;
+    if (selectedDepartments.length > 0) {
+      const allowedDeptIds = selectedDepartments.map((dep) => String(dep.value));
+      dataSource = membersData
+        .filter(
+          (member) =>
+            member.departmentIds && member.departmentIds.some((id) => allowedDeptIds.includes(id))
+        )
+        .map((member) => ({
+          cells: [
+            { columnId: ASSIGNEE_COL_ID, value: member.name },
+            { columnId: OPEN_STATUS_COL_ID, value: member.tickets.open?.toString() || "0" },
+            { columnId: HOLD_STATUS_COL_ID, value: member.tickets.hold?.toString() || "0" },
+            { columnId: ESCALATED_STATUS_COL_ID, value: member.tickets.escalated?.toString() || "0" },
+            { columnId: UNASSIGNED_STATUS_COL_ID, value: member.tickets.unassigned?.toString() || "0" },
+            { columnId: IN_PROGRESS_STATUS_COL_ID, value: member.tickets.inProgress?.toString() || "0" },
+          ],
+          departmentIds: member.departmentIds || [],
+          latestUnassignedTicketId: member.latestUnassignedTicketId || null,
+          key:
+            (member.departmentIds ? member.departmentIds.join(",") : "no_department") +
+            "_" +
+            member.id,
+        }));
+    }
+    if (selectedCandidates.length > 0) {
+      const allowedNames = selectedCandidates.map((c) => c.value.trim().toLowerCase());
+      dataSource = dataSource.filter((row) =>
+        allowedNames.includes(
+          row.cells.find((c) => c.columnId === ASSIGNEE_COL_ID)?.value?.trim().toLowerCase()
+        )
+      );
+    }
+    const filteredCandidatesArr = dataSource.map((row) => [
+      row.cells.find((c) => c.columnId === ASSIGNEE_COL_ID)?.value,
+      {
+        open: Number(row.cells.find((c) => c.columnId === OPEN_STATUS_COL_ID)?.value || 0),
+        hold: Number(row.cells.find((c) => c.columnId === HOLD_STATUS_COL_ID)?.value || 0),
+        escalated: Number(row.cells.find((c) => c.columnId === ESCALATED_STATUS_COL_ID)?.value || 0),
+        unassigned: Number(row.cells.find((c) => c.columnId === UNASSIGNED_STATUS_COL_ID)?.value || 0),
+        inProgress: Number(row.cells.find((c) => c.columnId === IN_PROGRESS_STATUS_COL_ID)?.value || 0),
+        latestUnassignedTicketId: row.latestUnassignedTicketId || null,
+      },
+    ]);
+    setFilteredCandidates(filteredCandidatesArr);
+
+    const sorted = [...filteredCandidatesArr].sort((a, b) => {
+      if (a[0] < b[0]) return sortOrder === "asc" ? -1 : 1;
+      if (a[0] > b[0]) return sortOrder === "asc" ? 1 : -1;
+      return 0;
+    });
+
+    const nonZero = sorted.filter(
+      ([, c]) => c.open > 0 || c.hold > 0 || c.escalated > 0 || c.unassigned > 0 || c.inProgress > 0
+    );
+
+    const totalPages = Math.ceil(nonZero.length / CANDIDATES_PER_PAGE);
+    if (currentPage > totalPages && totalPages > 0) setCurrentPage(1);
+    const start = (currentPage - 1) * CANDIDATES_PER_PAGE;
+    const end = Math.min(start + CANDIDATES_PER_PAGE, nonZero.length);
+
+    const cells = [];
+    for (let i = start; i < end; i++) {
+      const [candidate, counts] = nonZero[i];
+      cells.push(
+        <div key={candidate} className="grid-cell" style={{ animationDelay: `${(i - start) * 65}ms` }}>
+          <div className="candidate-name">{candidate}</div>
+          <div className="ticket-counts" style={{ justifyContent: "center", display: "flex", gap: 10 }}>
+            <div className="count-box total">{getAgentDisplayCount(counts, selectedStatusKeys)}</div>
+          </div>
+        </div>
+      );
+    }
+    setGridCells(cells);
+  }, [
+    rows,
+    membersData,
+    departmentRows,
+    currentPage,
+    sortOrder,
+    selectedDepartments,
+    selectedCandidates,
+    selectedStatuses,
+  ]);
+
+  useEffect(() => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    const rowCount = filteredCandidates.length;
+    const totalPages = Math.ceil(rowCount / CANDIDATES_PER_PAGE);
+    if (totalPages > 1) {
+      intervalRef.current = setInterval(() => {
+        setCurrentPage((prev) => (prev < totalPages ? prev + 1 : 1));
+      }, 10000);
+    }
+    return () => intervalRef.current && clearInterval(intervalRef.current);
+  }, [filteredCandidates]);
+
+ const departmentsPerPage = 1; // Only 1 department visible at a time
+const departmentDropdownOptions = useMemo(() => {
+  return departmentsList.map((dep, idx) => ({
+    value: dep.id,
+    label: dep.name,
+    key: String(dep.id) + "_" + idx,
+    deptAgentMap: departmentMembersMap,
+  }));
+}, [departmentsList, departmentMembersMap]);
+
+const totalDeptPages = Math.ceil(departmentDropdownOptions.length / departmentsPerPage);
+const pageStartIdx = (currentDeptPage - 1) * departmentsPerPage;
+const currentDepartments = departmentDropdownOptions.slice(pageStartIdx, pageStartIdx + departmentsPerPage);
+
+const departmentBgColors = [
+  "linear-gradient(135deg, #6a80ff 30%, #8edeff 100%)",
+  "linear-gradient(135deg, #d5ff80 30%, #ffc164 100%)",
+  "linear-gradient(135deg, #ffb1b1 30%, #d592ff 100%)",
+  "linear-gradient(135deg, #6ef9a0 30%, #58d6ff 100%)",
+  "linear-gradient(135deg, #ffe298 30%, #ff8e91 100%)",
+];
+
+let departmentGrids = null;
+if (selectedDepartments.length > 0 && currentDepartments.length > 0) {
+  // Show only the one department per pager state
+  const dep = currentDepartments[0];
+  const allowedDeptId = String(dep.value);
+
+  // Find all agents for this department using membersData
+  const departmentMembersRows = membersData.filter(
+    (m) =>
+      Array.isArray(m.departmentIds) && m.departmentIds.includes(allowedDeptId)
+  );
+  const uniqueDepartmentAgents = Array.from(
+    new Set(departmentMembersRows.map((agent) => agent.name.trim()))
+  ).sort((a, b) => a.localeCompare(b));
+
+  const agentCards = uniqueDepartmentAgents.map((name) => {
+    const agentForDept = membersData.find(
+      (m) =>
+        m.name.trim() === name &&
+        Array.isArray(m.departmentIds) &&
+        m.departmentIds.includes(allowedDeptId)
+    );
+    const filteredTicketCount =
+      agentForDept && agentForDept.tickets
+        ? selectedStatusKeys
+            .filter((status) => status !== "total")
+            .map((status) => Number(agentForDept.tickets[status] || 0))
+            .reduce((a, b) => a + b, 0)
+        : 0;
+    return (
+      <div
+        key={agentForDept.id}
+        style={{
+          background: "rgba(32, 50, 98, 0.96)",
+          borderRadius: 18,
+          boxShadow: "0 2px 12px #34495e36, inset 0 2px 8px #ffc80013",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          padding: "12px 2px",
+          border: "3px solid #4ea1eb",
+          width: "100%",
+          maxWidth: 160,
+        }}
+      >
+        <div
+          style={{
+            color: "#fff",
+            fontWeight: 700,
+            fontSize: 18,
+            textAlign: "center",
+            marginBottom: 6,
+            wordBreak: "break-word",
+            width: "100%",
+          }}
+        >
+          {agentForDept.name}
+        </div>
+        <div
+          style={{
+            fontSize: 16,
+            fontWeight: 900,
+            background: "#ffd700",
+            color: "#25449B",
+            borderRadius: 9,
+            padding: "3px 15px",
+            margin: "0 auto",
+          }}
+        >
+          {filteredTicketCount}
+        </div>
+      </div>
+    );
+  });
+
+  departmentGrids = (
+    <>
+      <div
+        style={{
+          marginTop: 32,
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "flex-start",
+          width: "100%",
+        }}
+      >
+        <div
+          key={dep.value}
+          style={{
+            background: departmentBgColors[pageStartIdx % departmentBgColors.length],
+            borderRadius: 32,
+            boxShadow: "0 8px 40px rgba(31,80,154,0.14)",
+            padding: "18px 20px",
+            width: 700,
+            minWidth: 540,
+            minHeight: 350,
+            maxWidth: 900,
+            maxHeight: 540,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+          }}
+        >
+          <div
+            style={{
+              background: "#2d4673",
+              color: "#ffd700",
+              fontWeight: "bold",
+              fontSize: 26,
+              padding: "12px 34px",
+              borderRadius: 17,
+              textAlign: "center",
+              marginBottom: 18,
+              maxWidth: 360,
+              width: "100%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 20,
+            }}
+          >
+            {dep.label}
+          </div>
+          <div
+            style={{
+              display: "grid",
+              gap: "18px",
+              gridTemplateColumns: "repeat(5, 1fr)",
+              alignItems: "stretch",
+              justifyItems: "center",
+              width: "100%",
+              margin: "0 auto",
+              maxHeight: 350,
+              overflowY: "auto",
+            }}
+          >
+            {agentCards}
+          </div>
+        </div>
+      </div>
+      {totalDeptPages > 1 && (
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "center",
+            gap: 8,
+            marginTop: 26,
+          }}
+        >
+          <button
+            onClick={() =>
+              setCurrentDeptPage(currentDeptPage > 1 ? currentDeptPage - 1 : totalDeptPages)
+            }
+            style={{
+              background: "#2d4673",
+              color: "#ffd700",
+              fontWeight: 700,
+              fontSize: 22,
+              borderRadius: 10,
+              padding: "8px 22px",
+              border: "none",
+              cursor: "pointer",
+            }}
+          >
+            {"<"}
+          </button>
+          {Array.from({ length: totalDeptPages }).map((_, idx) => (
+            <div
+              key={idx}
+              style={{
+                width: 12,
+                height: 12,
+                borderRadius: "50%",
+                background: currentDeptPage === idx + 1 ? "#ffd700" : "#2d4673",
+                border: currentDeptPage === idx + 1 ? "2px solid #2d4673" : "2px solid #ffd700",
+                margin: "0 2px",
+                cursor: "pointer",
+              }}
+              onClick={() => setCurrentDeptPage(idx + 1)}
+            />
+          ))}
+          <button
+            onClick={() =>
+              setCurrentDeptPage(currentDeptPage < totalDeptPages ? currentDeptPage + 1 : 1)
+            }
+            style={{
+              background: "#2d4673",
+              color: "#ffd700",
+              fontWeight: 700,
+              fontSize: 22,
+              borderRadius: 10,
+              padding: "8px 22px",
+              border: "none",
+              cursor: "pointer",
+            }}
+          >
+            {">"}
+          </button>
+        </div>
+      )}
+    </>
+  );
+} else {
+  departmentGrids = (
+    <div
+      className="grid-container"
+      style={{
+        marginTop: 32,
+        display: "grid",
+        gap: "18px",
+        gridTemplateColumns: "repeat(5, 1fr)",
+        gridTemplateRows: "repeat(3, auto)",
+        maxWidth: 1300,
+        marginLeft: "auto",
+        marginRight: "auto",
+      }}
+    >
+      {gridCells}
+    </div>
+  );
+}
+
+  return (
+    <>
+      <div
+        className="dashboard-header-main"
+        style={{ maxWidth: 1300, margin: "0 auto 30px auto", position: "relative" }}
+      >
+        <div
+          className="dashboard-header-top"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            position: "relative",
+          }}
+        >
+          <img
+            className="header-image"
+            src="/suprajit_logo_BG.png"
+            alt="Left icon"
+            style={{ height: 80, width: "auto" }}
+          />
+          <div
+            className="dashboard-title-container"
+            style={{
+              fontWeight: 900,
+              fontSize: 60,
+              letterSpacing: 2,
+              color: "#e0eaff",
+              textShadow: "2px 2px 6px rgba(0, 0, 50, 0.7)",
+              userSelect: "none",
+              textTransform: "uppercase",
+              position: "relative",
+              zIndex: 2,
+            }}
+          >
+            TICKET DASHBOARD
+          </div>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "flex-end",
+              gap: 10,
+              position: "relative",
+              zIndex: 2,
+            }}
+          >
+            <img
+              className="header-image"
+              src="/IT-LOGO.png"
+              alt="Right icon"
+              style={{ height: 70, width: "auto" }}
+            />
+          </div>
+        </div>
+        <div
+          className="dashboard-header-filters"
+          style={{
+            maxWidth: 1400,
+            margin: "0 auto",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            width: "100%",
+          }}
+        >
+          <div style={{ height: 40 }} />
+          <div
+            className="legend-bar"
+            style={{
+              display: "flex",
+              gap: 10,
+              flex: filtersVisible ? "initial" : 1,
+              transition: "flex 0.3s ease",
+            }}
+          >
+            <div className="legend-item open" style={{ flex: 1, textAlign: "center", fontSize: 20, fontWeight: 900 }}>
+              OPEN{" "}
+              <span style={{ fontWeight: 900, marginLeft: 4 }}>{openSum !== null ? openSum.toString().padStart(3, "0") : "--"}</span>
+            </div>
+            <div className="legend-item hold" style={{ flex: 1, textAlign: "center", fontSize: 22, fontWeight: 900 }}>
+              HOLD{" "}
+              <span style={{ fontWeight: 900, marginLeft: 4 }}>{holdSum !== null ? holdSum.toString().padStart(3, "0") : "--"}</span>
+            </div>
+            <div className="legend-item inprogress" style={{ flex: 1, textAlign: "center", fontSize: 20, fontWeight: 900 }}>
+              IN PROGRESS{" "}
+              <span style={{ fontWeight: 900, marginLeft: 4 }}>{inProgressSum !== null ? inProgressSum.toString().padStart(3, "0") : "--"}</span>
+            </div>
+            <div className="legend-item escalated" style={{ flex: 1, textAlign: "center", fontSize: 20, fontWeight: 900 }}>
+              ESCALATED{" "}
+              <span style={{ fontWeight: 900, marginLeft: 4 }}>{escalatedSum !== null ? escalatedSum.toString().padStart(3, "0") : "--"}</span>
+            </div>
+            <div
+              className="unassigned-box-blink"
+              style={{
+                flex: 1,
+                textAlign: "center",
+                fontWeight: 900,
+                display: "flex",
+                justifyContent: "center",
+                alignItems: "center",
+                gap: 10,
+                paddingLeft: 24,
+                paddingRight: 0,
+              }}
+            >
+              UNASSIGNED{" "}
+              <span>{globalUnassignedSum !== null ? globalUnassignedSum.toString().padStart(3, "0") : "--"}</span>
+              <span
+  style={{
+    background: "#1e4489",
+    color: "#fff",
+    borderRadius: 14,
+    fontWeight: 900,
+    fontSize: 30,
+    userSelect: "none",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "120px",
+    height: "60px",
+    minWidth: "120px",
+    minHeight: "60px",
+    letterSpacing: 2,
+    boxSizing: "border-box"
+  }}
+>
+  {currentTicketNumber}
+</span>
+
+            </div>
+            {showLegendTotal && (
+              <div className="legend-item total"
+                style={{
+                  backgroundColor: "#ffd700",
+                  color: "#1e4489",
+                  fontWeight: 700,
+                  borderRadius: 12,
+                  padding: "0 10px",
+                  flex: 1,
+                  textAlign: "center",
+                  fontSize: 20,
+                }}>
+                TOTAL{" "}
+                <span>
+                  {(
+                    (selectedStatusKeys.includes("open") ? openSum || 0 : 0) +
+                    (selectedStatusKeys.includes("hold") ? holdSum || 0 : 0) +
+                    (selectedStatusKeys.includes("inProgress") ? inProgressSum || 0 : 0) +
+                    (selectedStatusKeys.includes("escalated") ? escalatedSum || 0 : 0) +
+                    (selectedStatusKeys.includes("unassigned") ? globalUnassignedSum || 0 : 0)
+                  )
+                    .toString()
+                    .padStart(3, "0")}
+                </span>
+              </div>
+            )}
+          </div>
+          <button
+            className="hamburger-btn"
+            style={{
+              width: 30,
+              height: 30,
+              borderRadius: 10,
+              border: "none",
+              cursor: "pointer",
+              marginLeft: 20,
+              display: "block",
+            }}
+            onClick={() => setFiltersVisible((v) => !v)}
+            aria-label="Toggle filters"
+          >
+            <FaBars size={18} color="#34495e" />
+          </button>
+          {filtersVisible && (
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ minWidth: 160 }}>
+                <Select
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option }}
+                  isMulti
+                  options={candidateOptions}
+                  value={selectedCandidates}
+                  onChange={setSelectedCandidates}
+                  placeholder="AGENTS"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                  filterOption={personFilterOption}
+                  isSearchable
+                  menuPlacement="auto"
+                  maxMenuHeight={240}
+                />
+              </div>
+              <div style={{ minWidth: 24 }} />
+              <div style={{ minWidth: 150 }}>
+                <Select
+                  closeMenuOn
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option: DepartmentOption }}
+                  isMulti
+                  options={departmentDropdownOptions}
+                  value={selectedDepartments}
+                  onChange={setSelectedDepartments}
+                  placeholder="DEPARTMENTS"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                  isSearchable
+                  menuPlacement="auto"
+                  maxMenuHeight={280}
+                />
+              </div>
+              <div style={{ minWidth: 160 }}>
+                <Select
+                  closeMenuOnSelect={false}
+                  hideSelectedOptions={false}
+                  components={{ Option }}
+                  isMulti
+                  options={statusOptions}
+                  value={selectedStatuses}
+                  onChange={setSelectedStatuses}
+                  placeholder="STATUSES"
+                  styles={selectStyles}
+                  menuPortalTarget={document.body}
+                />
+              </div>
+              <select
+                value={sortOrder}
+                onChange={(e) => setSortOrder(e.target.value)}
+                style={{ height: 40, width: 40, borderRadius: 10 }}
+              >
+                <option value="asc">Asc</option>
+                <option value="desc">Desc</option>
+              </select>
+            </div>
+          )}
+        </div>
+        {loading && (
+          <div style={{ display: "flex", justifyContent: "center", marginTop: 10 }}>
+            <FaSpinner className="spinning-icon" />
+          </div>
+        )}
+        {departmentGrids}
+      </div>
+    </>
+  );
+}
+
+export default TicketDashboard;
