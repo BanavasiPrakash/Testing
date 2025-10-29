@@ -1,0 +1,72 @@
+import React from 'react';
+
+export default function AgentTicketAgeTable({ membersData, onClose }) {
+  const tableRows = membersData
+    .map(agent => {
+      const tickets = agent.tickets || {};
+      const total = 
+        (tickets.open || 0) +
+        (tickets.hold || 0) +
+        (tickets.escalated || 0) +
+        (tickets.unassigned || 0) +
+        (tickets.inProgress || 0);
+
+      return {
+        name: agent.name,
+        total,
+        week: agent.ticketsOlderThanWeek || 0,
+        month: agent.ticketsOlderThanMonth || 0,
+      };
+    })
+    .filter(row => row.total > 0)
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return (
+    <div style={{ margin: '14px auto', maxWidth: 1300, position: 'relative' }}>
+      {onClose && (
+        <button
+          onClick={onClose}
+          style={{
+            position: 'absolute',
+            right: -16,
+            top: -16,
+            background: '#ff4444',
+            color: '#fff',
+            border: 'none',
+            borderRadius: '50%',
+            width: 36,
+            height: 36,
+            fontSize: 24,
+            fontWeight: 900,
+            cursor: 'pointer',
+            zIndex: 10,
+            boxShadow: '0 2px 8px #0007',
+          }}
+          aria-label="Close table"
+        >
+          ×
+        </button>
+      )}
+      <table style={{ width: '100%', borderCollapse: 'collapse', border: '2px solid #FF9900', fontSize: 16 }}>
+        <thead>
+          <tr style={{ background: '#FF9900', color: '#222', fontWeight: 700 }}>
+            <th style={{ border: '1px solid #444', padding: 10 }}>Agent Name</th>
+            <th style={{ border: '1px solid #444', padding: 10 }}>Total Ticket Count</th>
+            <th style={{ border: '1px solid #444', padding: 10 }}>More than 1 week Tickets</th>
+            <th style={{ border: '1px solid #444', padding: 10 }}>More than 1 month Tickets</th>
+          </tr>
+        </thead>
+        <tbody>
+          {tableRows.map(row => (
+            <tr key={row.name} style={{ background: '#222', color: '#fff', borderBottom: '1px solid #444' }}>
+              <td style={{ border: '1px solid #444', padding: 10 }}>{row.name}</td>
+              <td style={{ border: '1px solid #444', padding: 10 }}>{row.total}</td>
+              <td style={{ border: '1px solid #444', padding: 10 }}>{row.week}</td>
+              <td style={{ border: '1px solid #444', padding: 10 }}>{row.month}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
