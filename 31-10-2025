@@ -1,6 +1,6 @@
 import React from 'react';
 
-export default function AgentTicketAgeTable({ membersData, onClose }) {
+export default function AgentTicketAgeTable({ membersData, onClose, selectedAges = ["twoWeeks", "month"] }) {
   const tableRows = membersData
     .map(agent => {
       const tickets = agent.tickets || {};
@@ -10,20 +10,31 @@ export default function AgentTicketAgeTable({ membersData, onClose }) {
         (tickets.escalated || 0) +
         (tickets.unassigned || 0) +
         (tickets.inProgress || 0);
-
       return {
-  name: agent.name,
-  total,
-  twoWeeks: agent.ticketsBetweenTwoWeeksAndMonth || 0,
-  month: agent.ticketsOlderThanMonth || 0,
-};
-
+        name: agent.name,
+        total,
+        twoWeeks: agent.ticketsBetweenTwoWeeksAndMonth || 0,
+        month: agent.ticketsOlderThanMonth || 0,
+      };
     })
     .filter(row => row.total > 0)
     .sort((a, b) => a.name.localeCompare(b.name));
 
+  // columns config
+  const ageColumns = [
+    { key: "twoWeeks", label: "14 - 30 Days  Tickets" },
+    { key: "month", label: "30+ Days  Tickets" }
+  ];
+
+  // filter columns to show only selected
+  const columnsToShow = [
+    { key: "name", label: "Agent Name" },
+    { key: "total", label: "Total Ticket Count" },
+    ...ageColumns.filter(col => selectedAges.includes(col.key))
+  ];
+
   return (
-    <div style={{ margin: '14px auto', maxWidth: 1300, position: 'relative' }}>
+    <div style={{ margin: '14px auto', maxWidth: 1400, position: 'relative' }}>
       {onClose && (
         <button
           onClick={onClose}
@@ -50,20 +61,18 @@ export default function AgentTicketAgeTable({ membersData, onClose }) {
       )}
       <table style={{ width: '100%', borderCollapse: 'collapse', border: '2px solid #1e4489', fontSize: 16 }}>
         <thead>
-          <tr style={{ background: '#1e4489', color: 'white', fontWeight: 700 }}>
-            <th style={{ border: '1px solid #606060', padding: 10 }}>Agent Name</th>
-            <th style={{ border: '1px solid #606060', padding: 10 }}>Total Ticket Count</th>
-            <th style={{ border: '1px solid #606060', padding: 10 }}> 14 - 30 Days  Tickets </th>
-            <th style={{ border: '1px solid #606060', padding: 10 }}> 30+ Days  Tickets</th>
+          <tr style={{ background: '#1e4489', color: 'white', fontWeight: 900 }}>
+            {columnsToShow.map(col => (
+              <th style={{ border: '1px solid Black', padding: 10 }} key={col.key}>{col.label}</th>
+            ))}
           </tr>
         </thead>
         <tbody>
           {tableRows.map(row => (
-            <tr key={row.name} style={{ background: '#222', color: '#fff', borderBottom: '1px solid #444' }}>
-              <td style={{ border: '1px solid #444', padding: 10 }}>{row.name}</td>
-              <td style={{ border: '1px solid #444', padding: 10 }}>{row.total}</td>
-              <td style={{ border: '1px solid #444', padding: 10 }}>{row.twoWeeks}</td>
-              <td style={{ border: '1px solid #444', padding: 10 }}>{row.month}</td>
+            <tr key={row.name} style={{ background: 'white', color: 'Black', fontWeight: 700, borderBottom: '1px solid Black' }}>
+              {columnsToShow.map(col => (
+                <td style={{ border: '1px solid Black', padding: 10 }} key={col.key}>{row[col.key]}</td>
+              ))}
             </tr>
           ))}
         </tbody>
