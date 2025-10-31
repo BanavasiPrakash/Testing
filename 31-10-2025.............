@@ -201,6 +201,9 @@ function TicketDashboard() {
   const [showTimeDropdown, setShowTimeDropdown] = useState(false);
   const [gridCells, setGridCells] = useState([]);
   const intervalRef = useRef(null);
+  // State to keep track of which age columns are selected (default to both selected, or empty for none)
+const [selectedAges, setSelectedAges] = useState(["twoWeeks", "month"]);
+
 
   const statusOptions = [
     { value: "open", label: "Open" },
@@ -1168,27 +1171,56 @@ allDepartmentMemberNames.forEach((name) => {
                   TIME
                 </button>
                 {showTimeDropdown && (
-                  <div
-                    style={{
-                      position: "absolute",
-                      top: 50,
-                      left: 0,
-                      minWidth: 140,
-                      background: "#141845",
-                      color: "#fff",
-                      borderRadius: 12,
-                      boxShadow: "0 2px 8px #2f376238",
-                      zIndex: 8,
-                    }}
-                  >
-                    <div style={{ padding: "10px", cursor: "pointer" }} onMouseDown={() => handleTimeSelect("More than 1 week")}>
-                      More than 1 week
-                    </div>
-                    <div style={{ padding: "10px", cursor: "pointer" }} onMouseDown={() => handleTimeSelect("More than 1 month")}>
-                      More than 1 month
-                    </div>
-                  </div>
-                )}
+  <div
+    style={{
+      position: "absolute",
+      top: 50,
+      left: 0,
+      minWidth: 170,
+      background: "white",
+      color: "Black",
+      borderRadius: 12,
+      boxShadow: "0 2px 8px #2f376238",
+      zIndex: 8,
+      padding: "10px"
+    }}
+    tabIndex={-1}
+    onMouseDown={e => e.preventDefault()} // keep open on click
+  >
+    <label style={{ display: "flex", alignItems: "center", padding: "5px 0", cursor: "pointer" }}>
+      <input
+        type="checkbox"
+        checked={selectedAges.includes("twoWeeks")}
+        onChange={e => {
+          setSelectedAges(prev =>
+            e.target.checked
+              ? [...prev, "twoWeeks"]
+              : prev.filter(v => v !== "twoWeeks")
+          );
+        }}
+        style={{ marginRight: 8 }}
+      />
+      14 - 30 Days Tickets
+    </label>
+    <label style={{ display: "flex", alignItems: "center", padding: "5px 0", cursor: "pointer" }}>
+      <input
+        type="checkbox"
+        checked={selectedAges.includes("month")}
+        onChange={e => {
+          setSelectedAges(prev =>
+            e.target.checked
+              ? [...prev, "month"]
+              : prev.filter(v => v !== "month")
+          );
+        }}
+        style={{ marginRight: 8 }}
+      />
+      30+ Days Tickets
+    </label>
+  </div>
+)}
+
+                
               </div>
               <div style={{ minWidth: 115 }}>
                 <Select
@@ -1203,6 +1235,7 @@ allDepartmentMemberNames.forEach((name) => {
                   styles={selectStyles}
                   menuPortalTarget={document.body}
                 />
+                
               </div>
               <select
                 value={sortOrder}
@@ -1213,13 +1246,19 @@ allDepartmentMemberNames.forEach((name) => {
                 <option value="desc">Desc</option>
               </select>
             </div>
+            
           )}
         </div>
-        {agentTicketAgeFilter ? (
-          <AgentTicketAgeTable filter={agentTicketAgeFilter} membersData={membersData} onClose={() => setAgentTicketAgeFilter("")} />
-        ) : (
-          departmentGrids
-        )}
+        {selectedAges.length > 0 ? (
+  <AgentTicketAgeTable
+    membersData={membersData}
+    selectedAges={selectedAges}
+    onClose={() => setSelectedAges([])}
+  />
+) : (
+  departmentGrids
+)}
+
       </div>
     </>
   );
